@@ -1,0 +1,13 @@
+services:
+  frigate-merger:
+    build: .
+    container_name: frigate-merger
+    restart: unless-stopped
+    network_mode: host                      # чтобы видеть localhost:1883 и localhost:5000
+    volumes:
+      - ./event-merger.py:/app/event-merger.py:ro
+      - ./new_event/:/config/new_event:rw   # монтируем конфиг для доступа к папкам
+      - ./send/:/config/send:rw
+      - ./logs/:/config/logs:rw
+    environment:
+      - TZ=Europe/Moscow
