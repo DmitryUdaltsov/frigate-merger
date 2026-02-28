@@ -1,26 +1,24 @@
 FROM nvidia/cuda:12.3.2-runtime-ubuntu22.04
-FROM jrottenberg/ffmpeg:6.0-ubuntu
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Установка зависимостей
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         wget \
-        xz-utils \
         ca-certificates \
         python3 \
         python3-pip \
+        xz-utils \
     && \
     rm -rf /var/lib/apt/lists/*
 
-# Скачивание и установка статического FFmpeg (с NVENC поддержкой)
-# Используем последнюю стабильную версию с https://johnvansickle.com/ffmpeg/
+# Скачивание и установка статического FFmpeg с поддержкой NVENC
 RUN wget https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz && \
-    tar xJf ffmpeg-release-amd64-static.tar.xz --strip-components=1 -C /usr/local/bin/ \
-        ffmpeg-*-amd64-static/ffmpeg \
-        ffmpeg-*-amd64-static/ffprobe && \
-    rm ffmpeg-release-amd64-static.tar.xz
+    mkdir -p /tmp/ffmpeg && \
+    tar -xf ffmpeg-release-amd64-static.tar.xz -C /tmp/ffmpeg && \
+    chmod +x /tmp/ffmpeg/*/ffmpeg /tmp/ffmpeg/*/ffprobe && \
+    cp /tmp/ffmpeg/*/ffmpeg /tmp/ffmpeg/*/ffprobe /usr/local/bin/ && \
+    rm -rf /tmp/ffmpeg ffmpeg-release-amd64-static.tar.xz
 
 # Проверка версии FFmpeg
 RUN ffmpeg -version
