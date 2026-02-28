@@ -7,7 +7,6 @@ import subprocess
 import shutil
 import requests
 import logging
-import math
 from pathlib import Path
 
 FRIGATE_API_URL = "http://localhost:5000"
@@ -16,7 +15,6 @@ MQTT_TOPIC = "frigate/events"
 
 NEW_DIR = Path("/config/new_event")
 SEND_DIR = Path("/config/send")
-LOG_FILE = "/config/logs/merger.log"
 
 TIMEOUT = 60
 MAX_SAFE_SIZE_MB = 45
@@ -80,22 +78,37 @@ def normalize_video(input_path, output_path):
     cmd = [
         "ffmpeg",
         "-hwaccel", "cuda",
+        "-hwaccel_output_format", "cuda",
         "-fflags", "+genpts",
         "-i", str(input_path),
+
+        # CUDA scaling
         "-vf",
-        "scale=1920:1080:force_original_aspect_ratio=decrease,"
-        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,fps=15",
+        "scale_cuda=1280:720:force_original_aspect_ratio=decrease,"
+        "pad=1280:720:(ow-iw)/2:(oh-ih)/2",
+
         "-c:v", "h264_nvenc",
-        "-preset", "p4",           # оптимально для GTX 1650
-        "-rc", "vbr",
-        "-cq", str(CRF_VALUE),
-        "-b:v", "0",
+
+        # GTX 1650 оптимум
+        "-preset", "p5",        # лучше качество чем p4
+        "-tune", "hq",
+
+        # Telegram friendly
         "-profile:v", "high",
+        "-level", "4.1",
+
+        "-rc", "vbr",
+        "-cq", "24",
+        "-b:v", "2M",
+        "-maxrate", "2.5M",
+        "-bufsize", "5M",
+
         "-pix_fmt", "yuv420p",
-        "-vsync", "2",
-        "-video_track_timescale", "90000",
+        "-r", "15",
+
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", "96k",
+
         "-movflags", "+faststart",
         "-y",
         str(output_path)
@@ -309,13 +322,11 @@ def main():
     )
 
     # Создаём необходимые папки
-    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     NEW_DIR.mkdir(parents=True, exist_ok=True)
     SEND_DIR.mkdir(parents=True, exist_ok=True)
 
     logging.info("=" * 50)
     logging.info("Скрипт запущен")
-    logging.info(f"LOG_FILE (ignored, logs go to stdout) = {LOG_FILE}")
     logging.info("=" * 50)
 
     import paho.mqtt.client as mqtt

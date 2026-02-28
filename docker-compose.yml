@@ -3,11 +3,21 @@ services:
     build: .
     container_name: frigate-merger
     restart: unless-stopped
-    network_mode: host                      # чтобы видеть localhost:1883 и localhost:5000
+    network_mode: host
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+
     volumes:
       - ./event-merger.py:/app/event-merger.py:ro
-      - ./new_event/:/config/new_event:rw   # монтируем конфиг для доступа к папкам
+      - ./new_event/:/config/new_event:rw
       - ./send/:/config/send:rw
       - ./logs/:/config/logs:rw
+
     environment:
       - TZ=Europe/Moscow
+
+    runtime: nvidia
