@@ -118,7 +118,9 @@ def normalize_video(input_path, output_path):
         "-profile:v", "high",
         "-level", "4.1",
         "-force_key_frames", "expr:gte(t,n_forced*2)",
-        "-cq", "20",              # ← только CQ, без -rc и -b:v
+        "-b:v", "3M",
+        "-maxrate", "4M",
+        "-bufsize", "6M",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", "96k",
