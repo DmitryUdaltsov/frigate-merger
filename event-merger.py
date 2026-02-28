@@ -125,7 +125,6 @@ def normalize_video(input_path, output_path):
         "-c:a", "aac",
         "-b:a", "96k",
         "-movflags", "+faststart",
-        "-fps_mode", "vfr",
         "-y",
         str(output_path)
     ] + audio_option
