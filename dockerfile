@@ -1,4 +1,5 @@
 FROM nvidia/cuda:12.3.2-runtime-ubuntu22.04
+FROM jrottenberg/ffmpeg:6.0-ubuntu
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -14,11 +15,11 @@ RUN apt-get update && \
 
 # Скачивание и установка статического FFmpeg (с NVENC поддержкой)
 # Используем последнюю стабильную версию с https://johnvansickle.com/ffmpeg/
-RUN wget https://johnvansickle.com/ffmpeg/releases/ffmpeg-git-amd64-static.tar.xz && \
-    tar xJf ffmpeg-git-amd64-static.tar.xz --strip-components=1 -C /usr/local/bin/ \
+RUN wget https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz && \
+    tar xJf ffmpeg-release-amd64-static.tar.xz --strip-components=1 -C /usr/local/bin/ \
         ffmpeg-git-*/ffmpeg \
         ffmpeg-git-*/ffprobe && \
-    rm ffmpeg-git-amd64-static.tar.xz
+    rm ffmpeg-release-amd64-static.tar.xz
 
 # Проверка версии FFmpeg
 RUN ffmpeg -version
