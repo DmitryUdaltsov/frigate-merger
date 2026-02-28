@@ -59,6 +59,7 @@ def get_duration(path):
                 "ffprobe", "-v", "error",
                 "-show_entries", "format=duration",
                 "-of", "default=noprint_wrappers=1:nokey=1",
+                "-vframes", "1",  # ← выходит сразу после первого кадра
                 str(path)
             ],
             capture_output=True,
@@ -77,46 +78,43 @@ def get_duration(path):
 def normalize_video(input_path, output_path):
     cmd = [
         "ffmpeg",
+
+        # GPU decode
         "-hwaccel", "cuda",
-        "-hwaccel_output_format", "cuda",
+
         "-fflags", "+genpts",
         "-i", str(input_path),
 
-        # CUDA scaling
+        # CPU scaling (стабильно)
         "-vf",
-        "scale_cuda=1280:720:force_original_aspect_ratio=decrease,"
-        "pad=1280:720:(ow-iw)/2:(oh-ih)/2",
+        "scale=1280:720:force_original_aspect_ratio=decrease,"
+        "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black",
 
+        # GPU encode
         "-c:v", "h264_nvenc",
-
-        # GTX 1650 оптимум
-        "-preset", "p5",        # лучше качество чем p4
+        "-preset", "p5",
         "-tune", "hq",
 
-        # Telegram friendly
         "-profile:v", "high",
         "-level", "4.1",
-
+        "-force_key_frames", "expr:gte(t,n_forced*2)",
         "-rc", "vbr",
-        "-cq", "24",
-        "-b:v", "2M",
-        "-maxrate", "2.5M",
-        "-bufsize", "5M",
+        "-cq", "20",
+        "-b:v", "3M",
+        "-maxrate", "4M",
+        "-bufsize", "6M",
 
         "-pix_fmt", "yuv420p",
-        "-r", "15",
-
         "-c:a", "aac",
         "-b:a", "96k",
-
         "-movflags", "+faststart",
+        "-fps_mode", "vfr",
         "-y",
         str(output_path)
     ]
 
     run_ffmpeg(cmd)
-    os.chmod(output_path, 0o666)
-
+    os.chmod(output_path, 0o664)
 
 # ==================== DOWNLOAD ====================
 
@@ -131,8 +129,10 @@ def download_clip(event_id, camera, start_time):
 
         try:
             with requests.get(url, stream=True, timeout=(10, 120)) as resp:
-                if resp.status_code != 200:
-                    logging.warning(f"Download failed ({resp.status_code}) {event_id}")
+                try:
+                    resp.raise_for_status()
+                except requests.RequestException as e:
+                    logging.warning(f"HTTP error {resp.status_code} for {event_id}: {e}")
                     continue
 
                 with open(filepath, "wb") as f:
@@ -143,7 +143,7 @@ def download_clip(event_id, camera, start_time):
                 filepath.unlink(missing_ok=True)
                 continue
 
-            os.chmod(filepath, 0o666)
+            os.chmod(filepath, 0o664)
             logging.info(f"Downloaded: {filepath.name}")
             return filepath
 
@@ -181,6 +181,8 @@ def split_video(input_path, prefix):
             "-ss", str(current),
             "-t", str(segment_duration),
             "-i", str(input_path),
+            "-avoid_negative_ts",
+            "make_zero",
             "-c", "copy",
             "-y",
             str(out)
@@ -193,7 +195,7 @@ def split_video(input_path, prefix):
             logging.warning("Zero-length segment detected, stopping split.")
             break
 
-        os.chmod(out, 0o666)
+        os.chmod(out, 0o664)
         parts.append(out)
 
         current += part_dur
@@ -248,7 +250,7 @@ def merge_videos():
         if size_mb <= MAX_SAFE_SIZE_MB:
             final = SEND_DIR / f"merged_{timestamp}.mp4"
             shutil.move(str(merged_path), str(final))
-            os.chmod(final, 0o666)
+            os.chmod(final, 0o664)
         else:
             split_video(merged_path, f"merged_{timestamp}")
             merged_path.unlink(missing_ok=True)
@@ -275,6 +277,7 @@ def reset_timer():
         if timer:
             timer.cancel()
         timer = threading.Timer(TIMEOUT, merge_videos)
+        timer.daemon = True
         timer.start()
 
 
