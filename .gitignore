@@ -4,3 +4,5 @@
 /logs/
 /new_event/
 /send/
+/.gigaide/
+/.idea/

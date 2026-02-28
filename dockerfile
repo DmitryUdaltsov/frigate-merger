@@ -7,6 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         wget \
+        xz-utils \
         ca-certificates \
         python3 \
         python3-pip \
@@ -17,8 +18,8 @@ RUN apt-get update && \
 # Используем последнюю стабильную версию с https://johnvansickle.com/ffmpeg/
 RUN wget https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz && \
     tar xJf ffmpeg-release-amd64-static.tar.xz --strip-components=1 -C /usr/local/bin/ \
-        ffmpeg-git-*/ffmpeg \
-        ffmpeg-git-*/ffprobe && \
+        ffmpeg-*-amd64-static/ffmpeg \
+        ffmpeg-*-amd64-static/ffprobe && \
     rm ffmpeg-release-amd64-static.tar.xz
 
 # Проверка версии FFmpeg
