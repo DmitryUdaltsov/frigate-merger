@@ -17,12 +17,9 @@ MQTT_TOPIC = "frigate/events"
 NEW_DIR = Path("/config/new_event")
 SEND_DIR = Path("/config/send")
 
-# Таймер: максимальное ожидание после первого события (сек)
-MAX_WAIT = 120
-# Максимальное количество файлов до принудительного слияния
-MAX_FILES = 10
+MAX_WAIT = 120          # секунд после первого события
+MAX_FILES = 10          # макс. файлов до принудительного слияния
 
-# Параметры скачивания и обработки
 DOWNLOAD_DELAY_SEC = 25
 MAX_DOWNLOAD_ATTEMPTS = 4
 MAX_SAFE_SIZE_MB = 45
@@ -38,7 +35,6 @@ timer = None
 
 # ==================== UTILS ====================
 def run_ffmpeg(cmd, timeout=300):
-    """Запуск FFmpeg с логированием ошибок."""
     try:
         result = subprocess.run(
             cmd,
@@ -56,7 +52,6 @@ def run_ffmpeg(cmd, timeout=300):
         raise
 
 def get_duration(path):
-    """Получить длительность видео в секундах."""
     try:
         result = subprocess.run(
             [
@@ -76,7 +71,6 @@ def get_duration(path):
         return 0.0
 
 def has_audio_stream(path):
-    """Проверить наличие аудиопотока в файле."""
     try:
         result = subprocess.run(
             [
@@ -97,12 +91,6 @@ def has_audio_stream(path):
 
 # ==================== NORMALIZE ====================
 def normalize_video(input_path, output_path):
-    """
-    Привести видео к единому формату:
-    - аппаратное декодирование (cuda)
-    - программное масштабирование и паддинг до 1280x720
-    - аппаратное кодирование h264_nvenc с параметрами для Telegram
-    """
     audio_option = [] if has_audio_stream(input_path) else ["-an"]
 
     cmd = [
@@ -122,6 +110,7 @@ def normalize_video(input_path, output_path):
         "-maxrate", "4M",
         "-bufsize", "6M",
         "-pix_fmt", "yuv420p",
+        "-r", "15",                         # фиксированный FPS
         "-c:a", "aac",
         "-b:a", "96k",
         "-movflags", "+faststart",
@@ -134,7 +123,6 @@ def normalize_video(input_path, output_path):
 
 # ==================== DOWNLOAD ====================
 def download_clip(event_id, camera, start_time):
-    """Скачать клип из Frigate."""
     url = f"{FRIGATE_API_URL}/api/events/{event_id}/clip.mp4"
     filename = f"{int(start_time)}_{camera}_{event_id}.mp4"
     filepath = NEW_DIR / filename
@@ -155,7 +143,6 @@ def download_clip(event_id, camera, start_time):
                     for chunk in resp.iter_content(8192):
                         f.write(chunk)
 
-            # Проверка целостности
             if get_duration(filepath) < 1:
                 filepath.unlink(missing_ok=True)
                 logging.warning(f"Downloaded file {filename} has zero duration, deleted.")
@@ -174,7 +161,6 @@ def download_clip(event_id, camera, start_time):
 
 # ==================== SPLIT ====================
 def split_video(input_path, prefix):
-    """Разрезать видео на части, если оно слишком большое."""
     duration = get_duration(input_path)
     if duration <= 0:
         return [input_path]
@@ -222,7 +208,6 @@ def split_video(input_path, prefix):
 
 # ==================== MERGE ====================
 def merge_videos():
-    """Объединить все видео в new_event и переместить результат в send."""
     global first_event_time, merge_scheduled
 
     if not merge_lock.acquire(blocking=False):
@@ -250,7 +235,6 @@ def merge_videos():
                 normalized_files.append(target)
             except Exception as e:
                 logging.error(f"Failed to normalize {file.name}: {e}")
-                # Удаляем битый исходник, чтобы не мешал
                 file.unlink(missing_ok=True)
 
         if not normalized_files:
@@ -265,15 +249,38 @@ def merge_videos():
 
         merged_path = NEW_DIR / f"merged_{timestamp}.mp4"
 
-        run_ffmpeg([
+        # Определяем наличие аудио (по первому нормализованному файлу)
+        has_audio = has_audio_stream(normalized_files[0])
+
+        # Конкатенация с перекодированием
+        concat_cmd = [
             "ffmpeg",
             "-f", "concat",
             "-safe", "0",
+            "-fflags", "+genpts",
             "-i", str(list_file),
-            "-c", "copy",
-            "-y",
-            str(merged_path)
-        ])
+            "-c:v", "h264_nvenc",
+            "-preset", "p5",
+            "-tune", "hq",
+            "-profile:v", "high",
+            "-level", "4.1",
+            "-force_key_frames", "expr:gte(t,n_forced*2)",
+            "-b:v", "3M",
+            "-maxrate", "4M",
+            "-bufsize", "6M",
+            "-pix_fmt", "yuv420p",
+            "-r", "15",
+            "-movflags", "+faststart",
+        ]
+
+        if has_audio:
+            concat_cmd.extend(["-c:a", "aac", "-b:a", "96k"])
+        else:
+            concat_cmd.append("-an")
+
+        concat_cmd.extend(["-y", str(merged_path)])
+
+        run_ffmpeg(concat_cmd)
 
         size_mb = os.path.getsize(merged_path) / (1024 * 1024)
 
@@ -287,7 +294,7 @@ def merge_videos():
             merged_path.unlink(missing_ok=True)
             logging.info(f"Split into {len(parts)} parts")
 
-        # Удаляем исходные файлы (только те, что были успешно обработаны)
+        # Удаляем исходные файлы
         for f in files:
             f.unlink(missing_ok=True)
 
@@ -298,14 +305,11 @@ def merge_videos():
         merge_lock.release()
         if temp_dir and temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
-
-        # Сброс глобальных флагов для новой пачки событий
         first_event_time = None
         merge_scheduled = False
 
-# ==================== TIMER MANAGEMENT ====================
+# ==================== TIMER ====================
 def schedule_merge():
-    """Запланировать слияние через MAX_WAIT секунд."""
     global merge_scheduled
     if not merge_scheduled:
         merge_scheduled = True
@@ -314,27 +318,23 @@ def schedule_merge():
 
 # ==================== EVENT HANDLER ====================
 def handle_event_download(event_id, camera, start_time):
-    """Обработчик события: скачать клип и при необходимости запустить слияние."""
     global first_event_time, merge_scheduled
 
     path = download_clip(event_id, camera, start_time)
     if not path:
         return
 
-    # Если это первое событие в текущей пачке
     if first_event_time is None:
         first_event_time = time.time()
         schedule_merge()
         logging.debug("First event in batch, timer started")
 
-    # Проверяем, не превышен ли лимит файлов
     file_count = len(list(NEW_DIR.glob("*.mp4")))
     if file_count >= MAX_FILES:
         logging.info(f"File count reached {file_count}, forcing merge")
         merge_videos()
 
 def on_message(client, userdata, msg):
-    """Обработчик MQTT-сообщений."""
     try:
         payload = json.loads(msg.payload.decode())
         if payload.get("type") != "end":
@@ -366,7 +366,6 @@ def main():
         stream=sys.stdout
     )
 
-    # Создаём папки
     NEW_DIR.mkdir(parents=True, exist_ok=True)
     SEND_DIR.mkdir(parents=True, exist_ok=True)
 
