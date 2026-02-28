@@ -106,11 +106,11 @@ def normalize_video(input_path, output_path):
         "-profile:v", "high",
         "-level", "4.1",
         "-force_key_frames", "expr:gte(t,n_forced*2)",
-        "-b:v", "3M",
-        "-maxrate", "4M",
-        "-bufsize", "6M",
+        "-b:v", "4M",                # увеличен битрейт
+        "-maxrate", "5M",
+        "-bufsize", "8M",
         "-pix_fmt", "yuv420p",
-        "-r", "15",                         # фиксированный FPS
+        "-r", "20",                   # фиксированный FPS = 20
         "-c:a", "aac",
         "-b:a", "96k",
         "-movflags", "+faststart",
@@ -252,7 +252,7 @@ def merge_videos():
         # Определяем наличие аудио (по первому нормализованному файлу)
         has_audio = has_audio_stream(normalized_files[0])
 
-        # Конкатенация с перекодированием
+        # Конкатенация с перекодированием (теперь CFR=20)
         concat_cmd = [
             "ffmpeg",
             "-f", "concat",
@@ -265,11 +265,11 @@ def merge_videos():
             "-profile:v", "high",
             "-level", "4.1",
             "-force_key_frames", "expr:gte(t,n_forced*2)",
-            "-b:v", "3M",
-            "-maxrate", "4M",
-            "-bufsize", "6M",
+            "-b:v", "4M",
+            "-maxrate", "5M",
+            "-bufsize", "8M",
             "-pix_fmt", "yuv420p",
-            "-r", "15",
+            "-r", "20",
             "-movflags", "+faststart",
         ]
 
