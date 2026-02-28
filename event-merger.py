@@ -18,7 +18,7 @@ NEW_DIR = Path("/config/new_event")
 SEND_DIR = Path("/config/send")
 
 # Таймер: максимальное ожидание после первого события (сек)
-MAX_WAIT = 30
+MAX_WAIT = 120
 # Максимальное количество файлов до принудительного слияния
 MAX_FILES = 10
 
