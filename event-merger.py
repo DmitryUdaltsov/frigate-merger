@@ -100,7 +100,7 @@ def normalize_video(input_path, output_path):
     """
     Привести видео к единому формату:
     - аппаратное декодирование (cuda)
-    - программное масштабирование и паддинг до 1280x720 (стабильно)
+    - программное масштабирование и паддинг до 1280x720
     - аппаратное кодирование h264_nvenc с параметрами для Telegram
     """
     audio_option = [] if has_audio_stream(input_path) else ["-an"]
@@ -118,11 +118,7 @@ def normalize_video(input_path, output_path):
         "-profile:v", "high",
         "-level", "4.1",
         "-force_key_frames", "expr:gte(t,n_forced*2)",
-        "-rc", "vbr",
-        "-cq", "20",
-        "-b:v", "3M",
-        "-maxrate", "4M",
-        "-bufsize", "6M",
+        "-cq", "20",              # ← только CQ, без -rc и -b:v
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", "96k",
