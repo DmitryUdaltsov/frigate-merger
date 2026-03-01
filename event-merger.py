@@ -161,6 +161,7 @@ def download_clip(event_id, camera, start_time):
 
 # ==================== SPLIT ====================
 def split_video(input_path, prefix):
+    """Разрезать видео на части с перекодированием (если слишком большое)."""
     duration = get_duration(input_path)
     if duration <= 0:
         return [input_path]
@@ -169,6 +170,7 @@ def split_video(input_path, prefix):
     if size_mb <= MAX_SAFE_SIZE_MB:
         return [input_path]
 
+    # Параметры кодирования (как в normalize_video)
     bitrate = 4_000_000
     segment_duration = max(5, int((MAX_SEGMENT_BYTES * 8) / bitrate))
 
@@ -176,21 +178,43 @@ def split_video(input_path, prefix):
     current = 0
     index = 1
 
+    # Проверим наличие аудио один раз
+    has_audio = has_audio_stream(input_path)
+
     while current < duration:
         out = SEND_DIR / f"{prefix}_p{index:03d}.mp4"
 
+        # Базовые параметры кодирования
         cmd = [
             "ffmpeg",
+            "-hwaccel", "cuda",
             "-ss", str(current),
             "-t", str(segment_duration),
             "-i", str(input_path),
+            "-c:v", "h264_nvenc",
+            "-preset", "p5",
+            "-tune", "hq",
+            "-profile:v", "high",
+            "-level", "4.1",
+            "-force_key_frames", "expr:gte(t,n_forced*2)",
+            "-b:v", "4M",
+            "-maxrate", "5M",
+            "-bufsize", "8M",
+            "-pix_fmt", "yuv420p",
+            "-r", "20",
+            "-movflags", "+faststart",
             "-avoid_negative_ts", "make_zero",
-            "-c", "copy",
             "-y",
             str(out)
         ]
 
-        run_ffmpeg(cmd, timeout=120)
+        # Добавляем аудио, если есть
+        if has_audio:
+            cmd.extend(["-c:a", "aac", "-b:a", "96k"])
+        else:
+            cmd.append("-an")
+
+        run_ffmpeg(cmd, timeout=180)
 
         part_dur = get_duration(out)
         if part_dur <= 0:
