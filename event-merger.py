@@ -1,170 +1,146 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
+"""
+event-merger.py — объединяет клипы Frigate.
+Использует архитектуру очереди + умную нормализацию.
+"""
+
 import os
-import time
+import sys
 import json
-import threading
-import subprocess
-import shutil
-import requests
+import time
 import logging
+import subprocess
+import threading
+import queue
+import shutil
 from pathlib import Path
 
-# ==================== CONFIG ====================
-FRIGATE_API_URL = "http://localhost:5000"
-MQTT_BROKER = "localhost"
+import requests
+import paho.mqtt.client as mqtt
+
+# ========== КОНФИГ ==========
+FRIGATE_API_URL = "http://192.168.0.226:5000"
+MQTT_BROKER = "192.168.0.226"
 MQTT_TOPIC = "frigate/events"
+MQTT_PORT = 1883
+MQTT_USER = "frigate"
+MQTT_PASS = "frigate"
 
-NEW_DIR = Path("/config/new_event")
-SEND_DIR = Path("/config/send")
+BASE_DIR = Path("/config")
+NEW_DIR = BASE_DIR / "new_event"
+SEND_DIR = BASE_DIR / "send"
+TEMP_DIR = BASE_DIR / "temp_merge"
 
-MAX_FILES = 10                 # принудительное слияние при достижении
-CHECK_INTERVAL = 30            # периодическая проверка (сек)
-
-DOWNLOAD_DELAY_SEC = 25
-MAX_DOWNLOAD_ATTEMPTS = 4
-MAX_SAFE_SIZE_MB = 45
-TARGET_SEGMENT_MB = 32
+GROUP_TIMEOUT = 60          # ожидание новых событий (сек)
+MAX_FILES = 10              # принудительное слияние при достижении
+MAX_DOWNLOAD_ATTEMPTS = 4   # количество попыток скачивания
+DOWNLOAD_RETRY_DELAY = 15   # пауза между попытками (сек)
+MAX_SAFE_SIZE_MB = 45       # максимальный размер неразбитого видео
+TARGET_SEGMENT_MB = 32      # целевой размер сегмента при разбиении
 MAX_SEGMENT_BYTES = TARGET_SEGMENT_MB * 1024 * 1024
 
-# ==================== GLOBALS ====================
+# Настройка логов
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
+logger = logging.getLogger("event-merger")
+
+# ========== ИНИЦИАЛИЗАЦИЯ ==========
+NEW_DIR.mkdir(parents=True, exist_ok=True)
+SEND_DIR.mkdir(parents=True, exist_ok=True)
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+event_queue = queue.Queue()
 merge_lock = threading.Lock()
 
-# ==================== UTILS ====================
-def run_ffmpeg(cmd, timeout=300):
-    try:
-        result = subprocess.run(
-            cmd,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout
-        )
-        return result
-    except subprocess.CalledProcessError as e:
-        logging.error(f"FFmpeg error:\n{' '.join(cmd)}\n{e.stderr}")
-        raise
-    except subprocess.TimeoutExpired:
-        logging.error(f"FFmpeg timeout:\n{' '.join(cmd)}")
-        raise
-
-def get_duration(path):
-    try:
-        result = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                str(path)
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True
-        )
-        return float(result.stdout.strip())
-    except (subprocess.SubprocessError, ValueError, OSError) as e:
-        logging.warning(f"Failed to get duration for {path}: {e}")
-        return 0.0
-
+# ========== УТИЛИТЫ ==========
 def has_audio_stream(path):
     try:
-        result = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-select_streams", "a",
-                "-show_entries", "stream=codec_type",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                str(path)
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True
-        )
-        return bool(result.stdout.strip())
+        result = subprocess.run([
+            "ffprobe", "-v", "error", "-select_streams", "a",
+            "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+            str(path)
+        ], capture_output=True, text=True, timeout=10, check=True)
+        return len(result.stdout.strip()) > 0
     except Exception:
         return False
 
-# ==================== NORMALIZE ====================
-def normalize_video(input_path, output_path):
-    audio_option = [] if has_audio_stream(input_path) else ["-an"]
+def get_duration(path):
+    try:
+        result = subprocess.run([
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(path)
+        ], capture_output=True, text=True, timeout=10, check=True)
+        return float(result.stdout.strip())
+    except Exception:
+        return 0.0
 
+def run_ffmpeg(cmd, timeout=300):
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout)
+        return result
+    except subprocess.CalledProcessError as e:
+        logger.error(f"FFmpeg error:\n{' '.join(cmd)}\n{e.stderr}")
+        raise
+    except Exception as e:
+        logger.error(f"FFmpeg failed: {e}")
+        raise
+
+# ========== НОРМАЛИЗАЦИЯ ==========
+def normalize_video(input_path, output_path):
+    audio_args = [] if has_audio_stream(input_path) else ["-an"]
     cmd = [
-        "ffmpeg",
-        "-hwaccel", "cuda",
-        "-fflags", "+genpts",
+        "ffmpeg", "-hwaccel", "cuda", "-fflags", "+genpts",
         "-i", str(input_path),
         "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,"
                "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,fps=20",
-        "-c:v", "h264_nvenc",
-        "-preset", "p5",
-        "-tune", "hq",
-        "-profile:v", "high",
-        "-level", "4.1",
+        "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
+        "-profile:v", "high", "-level", "4.1",
         "-force_key_frames", "expr:gte(t,n_forced*2)",
-        "-b:v", "4M",
-        "-maxrate", "5M",
-        "-bufsize", "8M",
+        "-b:v", "4M", "-maxrate", "5M", "-bufsize", "8M",
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "96k",
-        "-movflags", "+faststart",
-        "-y",
-        str(output_path)
-    ] + audio_option
-
+        "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart",
+        "-y", str(output_path)
+    ] + audio_args
     run_ffmpeg(cmd)
     os.chmod(output_path, 0o664)
 
-# ==================== DOWNLOAD ====================
+# ========== СКАЧИВАНИЕ ==========
 def download_clip(event_id, camera, start_time):
     url = f"{FRIGATE_API_URL}/api/events/{event_id}/clip.mp4"
     filename = f"{int(start_time)}_{camera}_{event_id}.mp4"
     filepath = NEW_DIR / filename
 
     for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
-        if attempt > 1:
-            time.sleep(15)
-
         try:
-            with requests.get(url, stream=True, timeout=(10, 120)) as resp:
-                try:
-                    resp.raise_for_status()
-                except requests.RequestException as e:
-                    logging.warning(f"HTTP error {resp.status_code} for {event_id}: {e}")
-                    continue
-
+            with requests.get(url, stream=True, timeout=(10, 120)) as r:
+                r.raise_for_status()
                 with open(filepath, "wb") as f:
-                    for chunk in resp.iter_content(8192):
+                    for chunk in r.iter_content(8192):
                         f.write(chunk)
-
             if get_duration(filepath) < 1:
                 filepath.unlink(missing_ok=True)
-                logging.warning(f"Downloaded file {filename} has zero duration, deleted.")
+                logger.warning(f"Downloaded file {filename} has zero duration, retrying...")
                 continue
-
             os.chmod(filepath, 0o664)
-            logging.info(f"Downloaded: {filepath.name}")
+            logger.info(f"Downloaded: {filename}")
             return filepath
-
         except Exception as e:
-            logging.warning(f"Download error {event_id}: {e}")
-            time.sleep(5)
-
-    logging.error(f"Failed to download clip: {event_id}")
+            logger.warning(f"Download attempt {attempt} failed for {event_id}: {e}")
+            if attempt < MAX_DOWNLOAD_ATTEMPTS:
+                time.sleep(DOWNLOAD_RETRY_DELAY)
+    logger.error(f"Failed to download {event_id} after {MAX_DOWNLOAD_ATTEMPTS} attempts")
     return None
 
-# ==================== SPLIT ====================
+# ========== РАЗБИЕНИЕ ==========
 def split_video(input_path, prefix):
-    duration = get_duration(input_path)
-    if duration <= 0:
-        return [input_path]
-
     size_mb = os.path.getsize(input_path) / (1024 * 1024)
-    logging.info(f"Splitting {input_path.name}, duration: {duration:.2f}s, size: {size_mb:.2f}MB")
     if size_mb <= MAX_SAFE_SIZE_MB:
         return [input_path]
 
+    duration = get_duration(input_path)
     bitrate = 4_000_000
     segment_duration = max(5, int((MAX_SEGMENT_BYTES * 8) / bitrate))
 
@@ -175,220 +151,150 @@ def split_video(input_path, prefix):
 
     while current < duration:
         out = SEND_DIR / f"{prefix}_p{index:03d}.mp4"
-
         cmd = [
-            "ffmpeg",
-            "-hwaccel", "cuda",
-            "-fflags", "+genpts",
-            "-i", str(input_path),
-            "-ss", str(current),
-            "-t", str(segment_duration),
-            "-vf", "fps=20",
-            "-c:v", "h264_nvenc",
-            "-preset", "p5",
-            "-tune", "hq",
-            "-profile:v", "high",
-            "-level", "4.1",
+            "ffmpeg", "-hwaccel", "cuda", "-fflags", "+genpts",
+            "-i", str(input_path), "-ss", str(current), "-t", str(segment_duration),
+            "-vf", "fps=20", "-c:v", "h264_nvenc", "-preset", "p5",
             "-force_key_frames", "expr:gte(t,n_forced*2)",
-            "-b:v", "4M",
-            "-maxrate", "5M",
-            "-bufsize", "8M",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            "-avoid_negative_ts", "make_zero",
-            "-y",
-            str(out)
+            "-b:v", "4M", "-maxrate", "5M", "-bufsize", "8M",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-y", str(out)
         ]
-
         if has_audio:
             cmd.extend(["-c:a", "aac", "-b:a", "96k"])
         else:
             cmd.append("-an")
-
-        run_ffmpeg(cmd, timeout=180)
-
-        part_dur = get_duration(out)
+        run_ffmpeg(cmd)
         part_size = os.path.getsize(out) / (1024 * 1024)
-        if part_dur <= 0:
-            logging.error(f"Segment {out.name} has zero duration, deleting")
-            out.unlink(missing_ok=True)
-            break
-
-        logging.info(f"Created segment {out.name}, duration: {part_dur:.2f}s, size: {part_size:.2f}MB")
-        os.chmod(out, 0o664)
+        logger.info(f"Segment created: {out.name}, size: {part_size:.2f}MB")
         parts.append(out)
-
-        current += part_dur
+        current += get_duration(out)
         index += 1
 
     return parts
 
-# ==================== MERGE ====================
-def merge_videos():
-    if not merge_lock.acquire(blocking=False):
+# ========== ОБРАБОТКА ПАЧКИ ==========
+def process_batch(file_paths):
+    if not file_paths:
         return
 
-    temp_dir = None
+    logger.info(f"Processing batch of {len(file_paths)} files")
+    temp_dir = TEMP_DIR / f"batch_{int(time.time())}"
+    temp_dir.mkdir(exist_ok=True)
 
     try:
-        files = sorted(list(NEW_DIR.glob("*.mp4")))
-        if not files:
-            return
-
-        logging.info(f"Starting merge of {len(files)} files")
-
-        timestamp = int(time.time())
-        temp_dir = NEW_DIR / f"temp_{timestamp}"
-        temp_dir.mkdir(exist_ok=True)
-
-        normalized_files = []
-
-        for idx, file in enumerate(files):
-            target = temp_dir / f"norm_{idx:03d}.mp4"
+        normalized = []
+        for i, f in enumerate(file_paths):
+            norm = temp_dir / f"norm_{i:03d}.mp4"
             try:
-                normalize_video(file, target)
-                normalized_files.append(target)
+                normalize_video(f, norm)
+                normalized.append(norm)
             except Exception as e:
-                logging.error(f"Failed to normalize {file.name}: {e}")
-                file.unlink(missing_ok=True)
+                logger.error(f"Normalization failed {f}: {e}")
 
-        if not normalized_files:
-            logging.warning("No files successfully normalized, aborting merge")
+        if not normalized:
             return
 
         list_file = temp_dir / "list.txt"
-        with open(list_file, "w") as f:
-            for nf in normalized_files:
-                f.write(f"file '{nf.absolute()}'\n")
+        with open(list_file, "w") as lf:
+            for nf in normalized:
+                lf.write(f"file '{nf}'\n")
 
-        merged_path = NEW_DIR / f"merged_{timestamp}.mp4"
+        merged = NEW_DIR / f"merged_{int(time.time())}.mp4"
 
-        has_audio = has_audio_stream(normalized_files[0])
-
+        # Формируем команду concat с учётом аудио
         concat_cmd = [
-            "ffmpeg",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", str(list_file),
-            "-c:v", "h264_nvenc",
-            "-preset", "p5",
-            "-tune", "hq",
-            "-profile:v", "high",
-            "-level", "4.1",
-            "-force_key_frames", "expr:gte(t,n_forced*2)",
-            "-b:v", "4M",
-            "-maxrate", "5M",
-            "-bufsize", "8M",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "96k",
-            "-movflags", "+faststart",
-            "-y",
-            str(merged_path)
+            "ffmpeg", "-f", "concat", "-safe", "0", "-i", str(list_file),
+            "-c:v", "h264_nvenc", "-preset", "p5", "-b:v", "4M",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         ]
-
-        if not has_audio:
-            concat_cmd.insert(-2, "-an")
+        if has_audio_stream(normalized[0]):
+            concat_cmd.extend(["-c:a", "aac", "-b:a", "96k"])
+        else:
+            concat_cmd.append("-an")
+        concat_cmd.extend(["-y", str(merged)])
 
         run_ffmpeg(concat_cmd)
 
-        size_mb = os.path.getsize(merged_path) / (1024 * 1024)
+        parts = split_video(merged, merged.stem)
+        merged.unlink(missing_ok=True)
 
-        if size_mb <= MAX_SAFE_SIZE_MB:
-            final = SEND_DIR / f"merged_{timestamp}.mp4"
-            shutil.move(str(merged_path), str(final))
-            os.chmod(final, 0o664)
-            logging.info(f"Merged video moved to send: {final.name}")
-        else:
-            parts = split_video(merged_path, f"merged_{timestamp}")
-            merged_path.unlink(missing_ok=True)
-            logging.info(f"Split into {len(parts)} parts")
-
-        for f in files:
+        for f in file_paths:
             f.unlink(missing_ok=True)
 
-    except Exception as e:
-        logging.error(f"MERGE ERROR: {e}")
+        logger.info(f"Batch processed, {len(parts)} parts sent")
 
     finally:
-        merge_lock.release()
-        if temp_dir and temp_dir.exists():
+        if temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-# ==================== PERIODIC CHECK ====================
-def periodic_check():
+# ========== WORKER ==========
+def worker_loop():
+    logger.info("Worker started")
     while True:
-        time.sleep(CHECK_INTERVAL)
-        files = list(NEW_DIR.glob("*.mp4"))
-        if len(files) >= MAX_FILES:
-            logging.info(f"Periodic check: {len(files)} files ≥ {MAX_FILES}, merging")
-            merge_videos()
+        session_files = []
 
-# ==================== EVENT HANDLER ====================
-def handle_event_download(event_id, camera, start_time):
-    path = download_clip(event_id, camera, start_time)
-    if not path:
-        return
+        # Первое событие
+        data = event_queue.get()
+        if not data.get("after", {}).get("id"):
+            continue
+        eid, cam, ts = data["after"]["id"], data["after"]["camera"], data["after"]["start_time"]
+        f = download_clip(eid, cam, ts)
+        if f:
+            session_files.append(f)
 
-    # Принудительный запуск при достижении лимита
-    file_count = len(list(NEW_DIR.glob("*.mp4")))
-    if file_count >= MAX_FILES:
-        logging.info(f"File count reached {file_count}, forcing merge")
-        merge_videos()
+        # Ожидание новых событий
+        while True:
+            # Проверка лимита файлов (принудительное слияние)
+            if len(session_files) >= MAX_FILES:
+                logger.info(f"File count limit reached ({MAX_FILES}), forcing merge")
+                break
+
+            try:
+                next_data = event_queue.get(timeout=GROUP_TIMEOUT)
+                neid, ncam, nts = next_data["after"]["id"], next_data["after"]["camera"], next_data["after"]["start_time"]
+                nf = download_clip(neid, ncam, nts)
+                if nf:
+                    session_files.append(nf)
+            except queue.Empty:
+                # Таймаут истёк — новых событий нет
+                break
+
+        if session_files:
+            process_batch(session_files)
+
+# ========== MQTT ==========
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        logger.info("Connected to MQTT")
+        client.subscribe(MQTT_TOPIC)
+    else:
+        logger.error(f"MQTT connect failed: {rc}")
 
 def on_message(client, userdata, msg):
-    logging.debug(f"MQTT received from {msg.topic}: {msg.payload.decode()[:200]}")
     try:
-        payload = json.loads(msg.payload.decode())
-        if payload.get("type") != "end":
-            return
-
-        after = payload.get("after", {})
-        event_id = after.get("id")
-        camera = after.get("camera")
-        start_time = after.get("start_time")
-
-        if not all([event_id, camera, start_time]):
-            return
-
-        threading.Thread(
-            target=handle_event_download,
-            args=(event_id, camera, start_time),
-            daemon=True
-        ).start()
-
+        data = json.loads(msg.payload.decode())
+        logger.debug(f"MQTT: {data.get('type')} {data.get('after',{}).get('camera')}")
+        if data.get("type") == "end":
+            event_queue.put(data)
     except Exception as e:
-        logging.error(f"MQTT message error: {e}")
+        logger.error(f"MQTT error: {e}")
 
-# ==================== MAIN ====================
+# ========== MAIN ==========
 def main():
-    import sys
-    initial_files = list(NEW_DIR.glob("*.mp4"))
-    if initial_files:
-        logging.info(f"Startup: Found {len(initial_files)} existing files, scheduling merge")
-        threading.Thread(target=merge_videos, daemon=True).start()
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        stream=sys.stdout
-    )
+    # Проверка файлов при старте
+    initial = list(NEW_DIR.glob("*.mp4"))
+    if initial:
+        logger.info(f"Startup: {len(initial)} files found → force merge")
+        threading.Thread(target=lambda: process_batch(initial), daemon=True).start()
 
-    NEW_DIR.mkdir(parents=True, exist_ok=True)
-    SEND_DIR.mkdir(parents=True, exist_ok=True)
+    threading.Thread(target=worker_loop, daemon=True).start()
 
-    logging.info("=" * 50)
-    logging.info("Скрипт запущен")
-    logging.info(f"MAX_FILES = {MAX_FILES}, CHECK_INTERVAL = {CHECK_INTERVAL}s")
-    logging.info("=" * 50)
-
-    # Запускаем поток периодической проверки
-    threading.Thread(target=periodic_check, daemon=True).start()
-
-    import paho.mqtt.client as mqtt
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    client.username_pw_set(MQTT_USER, MQTT_PASS)
+    client.on_connect = on_connect
     client.on_message = on_message
-    client.connect(MQTT_BROKER, 1883, 60)
-    client.subscribe(MQTT_TOPIC)
+    client.connect(MQTT_BROKER, MQTT_PORT, 60)
     client.loop_forever()
 
 if __name__ == "__main__":
