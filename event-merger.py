@@ -230,7 +230,8 @@ def split_video(input_path, prefix):
 
 # ==================== MERGE ====================
 def merge_videos():
-    global first_event_time, merge_scheduled
+    global first_event_time, merge_scheduled, timer
+    logging.info("merge_videos called")
 
     if not merge_lock.acquire(blocking=False):
         return
@@ -338,7 +339,7 @@ def schedule_merge():
 
 # ==================== EVENT HANDLER ====================
 def handle_event_download(event_id, camera, start_time):
-    global first_event_time, merge_scheduled
+    global first_event_time, merge_scheduled, timer
 
     path = download_clip(event_id, camera, start_time)
     if not path:
@@ -348,12 +349,17 @@ def handle_event_download(event_id, camera, start_time):
         if first_event_time is None:
             first_event_time = time.time()
             schedule_merge()
-            logging.debug("First event in batch, timer started")
+            logging.info("First event in batch, timer started")  # было debug
 
     file_count = len(list(NEW_DIR.glob("*.mp4")))
-    if file_count >= MAX_FILES and not merge_scheduled:
+    if file_count >= MAX_FILES:
         logging.info(f"File count reached {file_count}, forcing merge")
-        merge_scheduled = True
+        # Отменяем таймер, если он ещё не сработал
+        with timer_lock:
+            if timer:
+                timer.cancel()
+                timer = None
+            merge_scheduled = False  # разрешим новое планирование после merge
         merge_videos()
 
 def on_message(client, userdata, msg):
