@@ -17,8 +17,8 @@ MQTT_TOPIC = "frigate/events"
 NEW_DIR = Path("/config/new_event")
 SEND_DIR = Path("/config/send")
 
-MAX_WAIT = 120          # секунд после первого события
-MAX_FILES = 10          # макс. файлов до принудительного слияния
+MAX_FILES = 10                 # принудительное слияние при достижении
+CHECK_INTERVAL = 30            # периодическая проверка (сек)
 
 DOWNLOAD_DELAY_SEC = 25
 MAX_DOWNLOAD_ATTEMPTS = 4
@@ -28,10 +28,6 @@ MAX_SEGMENT_BYTES = TARGET_SEGMENT_MB * 1024 * 1024
 
 # ==================== GLOBALS ====================
 merge_lock = threading.Lock()
-first_event_time = None
-merge_scheduled = False
-timer_lock = threading.Lock()
-timer = None
 
 # ==================== UTILS ====================
 def run_ffmpeg(cmd, timeout=300):
@@ -99,7 +95,7 @@ def normalize_video(input_path, output_path):
         "-fflags", "+genpts",
         "-i", str(input_path),
         "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,"
-               "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,fps=20",  # FPS в фильтре
+               "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,fps=20",
         "-c:v", "h264_nvenc",
         "-preset", "p5",
         "-tune", "hq",
@@ -160,7 +156,6 @@ def download_clip(event_id, camera, start_time):
 
 # ==================== SPLIT ====================
 def split_video(input_path, prefix):
-    """Разрезать видео на части с перекодированием (если слишком большое)."""
     duration = get_duration(input_path)
     if duration <= 0:
         return [input_path]
@@ -188,7 +183,7 @@ def split_video(input_path, prefix):
             "-i", str(input_path),
             "-ss", str(current),
             "-t", str(segment_duration),
-            "-vf", "fps=20",  # FPS здесь тоже через фильтр
+            "-vf", "fps=20",
             "-c:v", "h264_nvenc",
             "-preset", "p5",
             "-tune", "hq",
@@ -230,9 +225,6 @@ def split_video(input_path, prefix):
 
 # ==================== MERGE ====================
 def merge_videos():
-    global first_event_time, merge_scheduled, timer
-    logging.info("merge_videos called")
-
     if not merge_lock.acquire(blocking=False):
         return
 
@@ -296,7 +288,7 @@ def merge_videos():
         ]
 
         if not has_audio:
-            concat_cmd.insert(-2, "-an")  # Вставляем -an перед выходным путём
+            concat_cmd.insert(-2, "-an")
 
         run_ffmpeg(concat_cmd)
 
@@ -322,44 +314,26 @@ def merge_videos():
         merge_lock.release()
         if temp_dir and temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
-        first_event_time = None
-        merge_scheduled = False
 
-# ==================== TIMER ====================
-def schedule_merge():
-    global merge_scheduled, timer
-    with timer_lock:
-        if merge_scheduled:
-            return
-        merge_scheduled = True
-        timer = threading.Timer(MAX_WAIT, merge_videos)
-        timer.daemon = True
-        timer.start()
-        logging.debug(f"Merge scheduled in {MAX_WAIT}s")
+# ==================== PERIODIC CHECK ====================
+def periodic_check():
+    while True:
+        time.sleep(CHECK_INTERVAL)
+        files = list(NEW_DIR.glob("*.mp4"))
+        if files:
+            logging.info(f"Periodic check: {len(files)} files found, merging")
+            merge_videos()
 
 # ==================== EVENT HANDLER ====================
 def handle_event_download(event_id, camera, start_time):
-    global first_event_time, merge_scheduled, timer
-
     path = download_clip(event_id, camera, start_time)
     if not path:
         return
 
-    with timer_lock:
-        if first_event_time is None:
-            first_event_time = time.time()
-            schedule_merge()
-            logging.info("First event in batch, timer started")  # было debug
-
+    # Принудительный запуск при достижении лимита
     file_count = len(list(NEW_DIR.glob("*.mp4")))
     if file_count >= MAX_FILES:
         logging.info(f"File count reached {file_count}, forcing merge")
-        # Отменяем таймер, если он ещё не сработал
-        with timer_lock:
-            if timer:
-                timer.cancel()
-                timer = None
-            merge_scheduled = False  # разрешим новое планирование после merge
         merge_videos()
 
 def on_message(client, userdata, msg):
@@ -399,8 +373,11 @@ def main():
 
     logging.info("=" * 50)
     logging.info("Скрипт запущен")
-    logging.info(f"MAX_WAIT = {MAX_WAIT}s, MAX_FILES = {MAX_FILES}")
+    logging.info(f"MAX_FILES = {MAX_FILES}, CHECK_INTERVAL = {CHECK_INTERVAL}s")
     logging.info("=" * 50)
+
+    # Запускаем поток периодической проверки
+    threading.Thread(target=periodic_check, daemon=True).start()
 
     import paho.mqtt.client as mqtt
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
