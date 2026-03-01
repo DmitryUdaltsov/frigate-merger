@@ -264,7 +264,7 @@ def worker_loop():
             process_batch(session_files)
 
 # ========== MQTT ==========
-def on_connect(client, userdata, flags, rc):
+def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         logger.info("Connected to MQTT")
         client.subscribe(MQTT_TOPIC)
