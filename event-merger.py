@@ -320,8 +320,8 @@ def periodic_check():
     while True:
         time.sleep(CHECK_INTERVAL)
         files = list(NEW_DIR.glob("*.mp4"))
-        if files:
-            logging.info(f"Periodic check: {len(files)} files found, merging")
+        if len(files) >= MAX_FILES:
+            logging.info(f"Periodic check: {len(files)} files ≥ {MAX_FILES}, merging")
             merge_videos()
 
 # ==================== EVENT HANDLER ====================
@@ -337,6 +337,7 @@ def handle_event_download(event_id, camera, start_time):
         merge_videos()
 
 def on_message(client, userdata, msg):
+    logging.debug(f"MQTT received from {msg.topic}: {msg.payload.decode()[:200]}")
     try:
         payload = json.loads(msg.payload.decode())
         if payload.get("type") != "end":
@@ -362,6 +363,10 @@ def on_message(client, userdata, msg):
 # ==================== MAIN ====================
 def main():
     import sys
+    initial_files = list(NEW_DIR.glob("*.mp4"))
+    if initial_files:
+        logging.info(f"Startup: Found {len(initial_files)} existing files, scheduling merge")
+        threading.Thread(target=merge_videos, daemon=True).start()
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
