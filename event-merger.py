@@ -99,18 +99,17 @@ def normalize_video(input_path, output_path):
         "-fflags", "+genpts",
         "-i", str(input_path),
         "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,"
-               "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black",
+               "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,fps=20",  # FPS в фильтре
         "-c:v", "h264_nvenc",
         "-preset", "p5",
         "-tune", "hq",
         "-profile:v", "high",
         "-level", "4.1",
         "-force_key_frames", "expr:gte(t,n_forced*2)",
-        "-b:v", "4M",                # увеличен битрейт
+        "-b:v", "4M",
         "-maxrate", "5M",
         "-bufsize", "8M",
         "-pix_fmt", "yuv420p",
-        "-r", "20",                   # фиксированный FPS = 20
         "-c:a", "aac",
         "-b:a", "96k",
         "-movflags", "+faststart",
@@ -167,30 +166,29 @@ def split_video(input_path, prefix):
         return [input_path]
 
     size_mb = os.path.getsize(input_path) / (1024 * 1024)
+    logging.info(f"Splitting {input_path.name}, duration: {duration:.2f}s, size: {size_mb:.2f}MB")
     if size_mb <= MAX_SAFE_SIZE_MB:
         return [input_path]
 
-    # Параметры кодирования (как в normalize_video)
     bitrate = 4_000_000
     segment_duration = max(5, int((MAX_SEGMENT_BYTES * 8) / bitrate))
 
     parts = []
     current = 0
     index = 1
-
-    # Проверим наличие аудио один раз
     has_audio = has_audio_stream(input_path)
 
     while current < duration:
         out = SEND_DIR / f"{prefix}_p{index:03d}.mp4"
 
-        # Базовые параметры кодирования
         cmd = [
             "ffmpeg",
             "-hwaccel", "cuda",
+            "-fflags", "+genpts",
+            "-i", str(input_path),
             "-ss", str(current),
             "-t", str(segment_duration),
-            "-i", str(input_path),
+            "-vf", "fps=20",  # FPS здесь тоже через фильтр
             "-c:v", "h264_nvenc",
             "-preset", "p5",
             "-tune", "hq",
@@ -201,14 +199,12 @@ def split_video(input_path, prefix):
             "-maxrate", "5M",
             "-bufsize", "8M",
             "-pix_fmt", "yuv420p",
-            "-r", "20",
             "-movflags", "+faststart",
             "-avoid_negative_ts", "make_zero",
             "-y",
             str(out)
         ]
 
-        # Добавляем аудио, если есть
         if has_audio:
             cmd.extend(["-c:a", "aac", "-b:a", "96k"])
         else:
@@ -217,11 +213,13 @@ def split_video(input_path, prefix):
         run_ffmpeg(cmd, timeout=180)
 
         part_dur = get_duration(out)
+        part_size = os.path.getsize(out) / (1024 * 1024)
         if part_dur <= 0:
-            logging.warning("Zero-length segment detected, stopping split.")
+            logging.error(f"Segment {out.name} has zero duration, deleting")
             out.unlink(missing_ok=True)
             break
 
+        logging.info(f"Created segment {out.name}, duration: {part_dur:.2f}s, size: {part_size:.2f}MB")
         os.chmod(out, 0o664)
         parts.append(out)
 
@@ -265,7 +263,6 @@ def merge_videos():
             logging.warning("No files successfully normalized, aborting merge")
             return
 
-        # Создаём список для concat
         list_file = temp_dir / "list.txt"
         with open(list_file, "w") as f:
             for nf in normalized_files:
@@ -273,15 +270,12 @@ def merge_videos():
 
         merged_path = NEW_DIR / f"merged_{timestamp}.mp4"
 
-        # Определяем наличие аудио (по первому нормализованному файлу)
         has_audio = has_audio_stream(normalized_files[0])
 
-        # Конкатенация с перекодированием (теперь CFR=20)
         concat_cmd = [
             "ffmpeg",
             "-f", "concat",
             "-safe", "0",
-            "-fflags", "+genpts",
             "-i", str(list_file),
             "-c:v", "h264_nvenc",
             "-preset", "p5",
@@ -293,16 +287,15 @@ def merge_videos():
             "-maxrate", "5M",
             "-bufsize", "8M",
             "-pix_fmt", "yuv420p",
-            "-r", "20",
+            "-c:a", "aac",
+            "-b:a", "96k",
             "-movflags", "+faststart",
+            "-y",
+            str(merged_path)
         ]
 
-        if has_audio:
-            concat_cmd.extend(["-c:a", "aac", "-b:a", "96k"])
-        else:
-            concat_cmd.append("-an")
-
-        concat_cmd.extend(["-y", str(merged_path)])
+        if not has_audio:
+            concat_cmd.insert(-2, "-an")  # Вставляем -an перед выходным путём
 
         run_ffmpeg(concat_cmd)
 
@@ -318,7 +311,6 @@ def merge_videos():
             merged_path.unlink(missing_ok=True)
             logging.info(f"Split into {len(parts)} parts")
 
-        # Удаляем исходные файлы
         for f in files:
             f.unlink(missing_ok=True)
 
@@ -334,10 +326,14 @@ def merge_videos():
 
 # ==================== TIMER ====================
 def schedule_merge():
-    global merge_scheduled
-    if not merge_scheduled:
+    global merge_scheduled, timer
+    with timer_lock:
+        if merge_scheduled:
+            return
         merge_scheduled = True
-        threading.Timer(MAX_WAIT, merge_videos).start()
+        timer = threading.Timer(MAX_WAIT, merge_videos)
+        timer.daemon = True
+        timer.start()
         logging.debug(f"Merge scheduled in {MAX_WAIT}s")
 
 # ==================== EVENT HANDLER ====================
@@ -348,14 +344,16 @@ def handle_event_download(event_id, camera, start_time):
     if not path:
         return
 
-    if first_event_time is None:
-        first_event_time = time.time()
-        schedule_merge()
-        logging.debug("First event in batch, timer started")
+    with timer_lock:
+        if first_event_time is None:
+            first_event_time = time.time()
+            schedule_merge()
+            logging.debug("First event in batch, timer started")
 
     file_count = len(list(NEW_DIR.glob("*.mp4")))
-    if file_count >= MAX_FILES:
+    if file_count >= MAX_FILES and not merge_scheduled:
         logging.info(f"File count reached {file_count}, forcing merge")
+        merge_scheduled = True
         merge_videos()
 
 def on_message(client, userdata, msg):
