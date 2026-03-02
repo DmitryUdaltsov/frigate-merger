@@ -202,10 +202,11 @@ def process_batch(file_paths):
 
         merged = NEW_DIR / f"merged_{int(time.time())}.mp4"
 
-        # Формируем команду concat с учётом аудио
+        # Конкатенация с единым битрейтом 2M
         concat_cmd = [
             "ffmpeg", "-f", "concat", "-safe", "0", "-i", str(list_file),
-            "-c:v", "h264_nvenc", "-preset", "p5", "-b:v", "4M",
+            "-c:v", "h264_nvenc", "-preset", "p5",
+            "-b:v", "2M", "-maxrate", "2.5M", "-bufsize", "5M",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         ]
         if has_audio_stream(normalized[0]):
@@ -216,13 +217,23 @@ def process_batch(file_paths):
 
         run_ffmpeg(concat_cmd)
 
-        parts = split_video(merged, merged.stem)
-        merged.unlink(missing_ok=True)
+        # Проверка размера итогового видео
+        merged_size_mb = os.path.getsize(merged) / (1024 * 1024)
+        if merged_size_mb <= MAX_SAFE_SIZE_MB:
+            # Если видео небольшое – просто перемещаем в send
+            final = SEND_DIR / f"{merged.stem}.mp4"
+            shutil.move(str(merged), str(final))
+            os.chmod(final, 0o664)
+            logger.info(f"Merged video moved to send: {final.name}")
+        else:
+            # Иначе разбиваем на части
+            parts = split_video(merged, merged.stem)
+            merged.unlink(missing_ok=True)
+            logger.info(f"Split into {len(parts)} parts")
 
+        # Удаляем исходные скачанные файлы
         for f in file_paths:
             f.unlink(missing_ok=True)
-
-        logger.info(f"Batch processed, {len(parts)} parts sent")
 
     finally:
         if temp_dir.exists():
