@@ -95,11 +95,11 @@ def normalize_video(input_path, output_path):
         "ffmpeg", "-hwaccel", "cuda", "-fflags", "+genpts",
         "-i", str(input_path),
         "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,"
-               "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,fps=20",
+               "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,fps=15",
         "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
         "-profile:v", "high", "-level", "4.1",
         "-force_key_frames", "expr:gte(t,n_forced*2)",
-        "-b:v", "4M", "-maxrate", "5M", "-bufsize", "8M",
+        "-b:v", "2M", "-maxrate", "2.5M", "-bufsize", "5M",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart",
         "-y", str(output_path)
@@ -154,9 +154,9 @@ def split_video(input_path, prefix):
         cmd = [
             "ffmpeg", "-hwaccel", "cuda", "-fflags", "+genpts",
             "-i", str(input_path), "-ss", str(current), "-t", str(segment_duration),
-            "-vf", "fps=20", "-c:v", "h264_nvenc", "-preset", "p5",
+            "-vf", "fps=15", "-c:v", "h264_nvenc", "-preset", "p5",
             "-force_key_frames", "expr:gte(t,n_forced*2)",
-            "-b:v", "4M", "-maxrate", "5M", "-bufsize", "8M",
+            "-b:v", "2M", "-maxrate", "2.5M", "-bufsize", "5M",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
             "-y", str(out)
         ]
