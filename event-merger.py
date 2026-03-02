@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-event-merger.py — объединяет клипы Frigate, отправляет в Telegram через прокси,
-переводит описания с английского на русский (опционально).
-Конфигурация вынесена в отдельный файл config.py
+event-merger.py — объединяет клипы Frigate, отправляет в Telegram с фото и видео,
+переводит описания на русский, добавляет имена распознанных лиц.
+Конфигурация в config.py.
 """
 
 import os
@@ -20,7 +20,11 @@ import requests
 import paho.mqtt.client as mqtt
 
 # ========== ИМПОРТ КОНФИГУРАЦИИ ==========
-from config import *
+try:
+    from config import *
+except ImportError:
+    print("ERROR: config.py not found. Please create config.py with required settings.")
+    sys.exit(1)
 
 # ========== ПУТИ ==========
 base_path = Path(BASE_DIR)
@@ -35,7 +39,8 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 event_queue = queue.Queue()
 merge_lock = threading.Lock()
-event_descriptions = {}
+event_descriptions = {}          # словарь {event_id: описание}
+event_faces = {}                 # словарь {event_id: {"name": имя, "score": уверенность}}
 
 # ========== ЛОГГЕР ==========
 logging.basicConfig(
@@ -85,13 +90,11 @@ def translate_to_russian(text):
 
     # Если текст уже содержит кириллицу, не переводим
     if any('\u0400' <= c <= '\u04FF' for c in text):
-        logger.debug("Text already contains Cyrillic, skipping translation")
         return text
 
     if len(text) < 3:
         return text
 
-    # Несколько вариантов промпта для повышения шанса успеха
     prompts = [
         f"""Translate the following text from English to Russian. Provide only the translation, no additional text.
 
@@ -103,7 +106,7 @@ Russian translation:""",
 {text}"""
     ]
 
-    for prompt in prompts:
+    for i, prompt in enumerate(prompts, 1):
         try:
             response = requests.post(
                 f"{OLLAMA_API_URL}/api/generate",
@@ -121,20 +124,19 @@ Russian translation:""",
             response.raise_for_status()
             result = response.json().get("response", "").strip()
             result = result.replace('"', '').strip()
-
             if result:
                 logger.info(f"Translated: '{text[:30]}...' -> '{result[:30]}...'")
                 return result
         except Exception as e:
-            logger.warning(f"Translation attempt with prompt #{prompts.index(prompt)+1} failed: {e}")
+            logger.warning(f"Translation attempt {i} failed: {e}")
             continue
 
     logger.error(f"All translation attempts failed for: {text[:50]}...")
-    return text  # возвращаем оригинал
+    return text
 
-def send_telegram_video(file_path, caption):
-    """Отправляет видео в Telegram через прокси (если настроено)."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
+def send_telegram_media_group(video_path, photo_path, caption):
+    """Отправляет фото и видео как группу медиа в Telegram."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup"
 
     proxies = None
     if TELEGRAM_PROXY_HOST and TELEGRAM_PROXY_PORT:
@@ -145,20 +147,68 @@ def send_telegram_video(file_path, caption):
         proxies = {"http": proxy_url, "https": proxy_url}
         logger.info(f"Using proxy: {TELEGRAM_PROXY_TYPE}://{TELEGRAM_PROXY_HOST}:{TELEGRAM_PROXY_PORT}")
 
+    media = []
+    files = {}
+    try:
+        if photo_path and Path(photo_path).exists():
+            media.append({
+                'type': 'photo',
+                'media': 'attach://photo',
+                'caption': caption,
+            })
+            files['photo'] = open(photo_path, 'rb')
+        media.append({
+            'type': 'video',
+            'media': 'attach://video',
+        })
+        files['video'] = open(video_path, 'rb')
+
+        payload = {
+            'chat_id': TELEGRAM_CHAT_ID,
+            'media': json.dumps(media)
+        }
+
+        for attempt in range(1, TELEGRAM_RETRY_ATTEMPTS + 1):
+            try:
+                response = requests.post(url, data=payload, files=files, timeout=60, proxies=proxies)
+                response.raise_for_status()
+                logger.info(f"Media group sent: {video_path.name}")
+                return True
+            except Exception as e:
+                logger.warning(f"Media group attempt {attempt} failed: {e}")
+                if attempt < TELEGRAM_RETRY_ATTEMPTS:
+                    time.sleep(TELEGRAM_RETRY_DELAY)
+        return False
+    finally:
+        for f in files.values():
+            f.close()
+
+def send_telegram_video(video_path, caption):
+    """Отправляет только видео (запасной вариант)."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
+
+    proxies = None
+    if TELEGRAM_PROXY_HOST and TELEGRAM_PROXY_PORT:
+        proxy_auth = ""
+        if TELEGRAM_PROXY_USER and TELEGRAM_PROXY_PASS:
+            proxy_auth = f"{TELEGRAM_PROXY_USER}:{TELEGRAM_PROXY_PASS}@"
+        proxy_url = f"{TELEGRAM_PROXY_TYPE}://{proxy_auth}{TELEGRAM_PROXY_HOST}:{TELEGRAM_PROXY_PORT}"
+        proxies = {"http": proxy_url, "https": proxy_url}
+
     for attempt in range(1, TELEGRAM_RETRY_ATTEMPTS + 1):
         try:
-            with open(file_path, 'rb') as video_file:
+            with open(video_path, 'rb') as video_file:
                 files = {'video': video_file}
                 data = {'chat_id': TELEGRAM_CHAT_ID, 'caption': caption}
                 response = requests.post(url, files=files, data=data, timeout=60, proxies=proxies)
                 response.raise_for_status()
-                logger.info(f"Telegram send success: {file_path.name}")
+                logger.info(f"Video sent: {video_path.name}")
                 return True
         except Exception as e:
-            logger.warning(f"Telegram send attempt {attempt} failed: {e}")
+            logger.warning(f"Video send attempt {attempt} failed: {e}")
             if attempt < TELEGRAM_RETRY_ATTEMPTS:
                 time.sleep(TELEGRAM_RETRY_DELAY)
-    logger.error(f"Failed to send {file_path.name} after {TELEGRAM_RETRY_ATTEMPTS} attempts")
+    logger.error(f"Failed to send {video_path.name} after {TELEGRAM_RETRY_ATTEMPTS} attempts")
     return False
 
 # ========== НОРМАЛИЗАЦИЯ ==========
@@ -182,30 +232,65 @@ def normalize_video(input_path, output_path):
 
 # ========== СКАЧИВАНИЕ ==========
 def download_clip(event_id, camera, start_time):
-    url = f"{FRIGATE_API_URL}/api/events/{event_id}/clip.mp4"
-    filename = f"{int(start_time)}_{camera}_{event_id}.mp4"
-    filepath = NEW_DIR / filename
+    """Скачивает видео и snapshot. Возвращает (video_path, snapshot_path)."""
+    video_url = f"{FRIGATE_API_URL}/api/events/{event_id}/clip.mp4"
+    snapshot_url = f"{FRIGATE_API_URL}/api/events/{event_id}/snapshot.jpg"
+    filename_base = f"{int(start_time)}_{camera}_{event_id}"
+    video_path = NEW_DIR / f"{filename_base}.mp4"
+    snapshot_path = NEW_DIR / f"{filename_base}.jpg"
 
+    video_ok = False
+    snapshot_ok = False
+
+    # Скачиваем видео
     for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
         try:
-            with requests.get(url, stream=True, timeout=(10, 120)) as r:
+            with requests.get(video_url, stream=True, timeout=(10, 120)) as r:
                 r.raise_for_status()
-                with open(filepath, "wb") as f:
+                with open(video_path, "wb") as f:
                     for chunk in r.iter_content(8192):
                         f.write(chunk)
-            if get_duration(filepath) < 1:
-                filepath.unlink(missing_ok=True)
-                logger.warning(f"Downloaded file {filename} has zero duration, retrying...")
+            if get_duration(video_path) < 1:
+                video_path.unlink(missing_ok=True)
+                logger.warning(f"Video {video_path.name} zero duration, retrying...")
                 continue
-            os.chmod(filepath, 0o664)
-            logger.info(f"Downloaded: {filename}")
-            return filepath
+            os.chmod(video_path, 0o664)
+            video_ok = True
+            break
         except Exception as e:
-            logger.warning(f"Download attempt {attempt} failed for {event_id}: {e}")
+            logger.warning(f"Video download attempt {attempt} failed for {event_id}: {e}")
             if attempt < MAX_DOWNLOAD_ATTEMPTS:
                 time.sleep(DOWNLOAD_RETRY_DELAY)
-    logger.error(f"Failed to download {event_id} after {MAX_DOWNLOAD_ATTEMPTS} attempts")
-    return None
+
+    if not video_ok:
+        logger.error(f"Failed to download video for {event_id}")
+        return (None, None)
+
+    # Скачиваем snapshot (до 2 попыток)
+    for attempt in range(1, 3):
+        try:
+            r = requests.get(snapshot_url, timeout=(10, 30))
+            if r.status_code == 200:
+                with open(snapshot_path, "wb") as f:
+                    f.write(r.content)
+                if os.path.getsize(snapshot_path) > 1000:  # не пустой
+                    os.chmod(snapshot_path, 0o664)
+                    snapshot_ok = True
+                    break
+                else:
+                    snapshot_path.unlink(missing_ok=True)
+            else:
+                logger.warning(f"Snapshot attempt {attempt} returned {r.status_code}")
+        except Exception as e:
+            logger.warning(f"Snapshot attempt {attempt} failed: {e}")
+        if attempt < 2:
+            time.sleep(2)
+
+    if not snapshot_ok:
+        logger.info(f"No snapshot for event {event_id}")
+
+    logger.info(f"Downloaded: {video_path.name}" + (f" + snapshot" if snapshot_ok else ""))
+    return (video_path, snapshot_path if snapshot_ok else None)
 
 # ========== РАЗБИЕНИЕ ==========
 def split_video(input_path, prefix):
@@ -247,30 +332,41 @@ def split_video(input_path, prefix):
     return parts
 
 # ========== ОБРАБОТКА ПАЧКИ ==========
-def process_batch(file_paths):  # file_paths: list of tuples (path, event_id, description)
+def process_batch(file_paths):  # список кортежей (video_path, snapshot_path, event_id, description, person_name)
     if not file_paths:
         return
 
     logger.info(f"Processing batch of {len(file_paths)} files")
 
-    descriptions = [desc for _, _, desc in file_paths if desc]
-    if descriptions:
-        final_description = descriptions[0]
+    # Собираем описания и имена
+    descriptions = [desc for _, _, _, desc, _ in file_paths if desc]
+    person_names = [name for _, _, _, _, name in file_paths if name]
+
+    # Формируем финальную подпись
+    if INCLUDE_FACE_NAME and person_names:
+        main_person = person_names[0]  # берём первое имя (обычно главное событие)
+        if descriptions:
+            final_description = f"{main_person}: {descriptions[0]}"
+        else:
+            final_description = f"Обнаружен {main_person}"
     else:
-        final_description = "Обнаружено движение"
+        final_description = descriptions[0] if descriptions else "Обнаружено движение"
+
+    # Берём snapshot первого события, если есть
+    first_snapshot = file_paths[0][1] if file_paths[0][1] and Path(file_paths[0][1]).exists() else None
 
     temp_dir = TEMP_DIR / f"batch_{int(time.time())}"
     temp_dir.mkdir(exist_ok=True)
 
     try:
         normalized = []
-        for i, (f_path, eid, desc) in enumerate(file_paths):
+        for i, (video_path, snap_path, eid, desc, person) in enumerate(file_paths):
             norm = temp_dir / f"norm_{i:03d}.mp4"
             try:
-                normalize_video(f_path, norm)
+                normalize_video(video_path, norm)
                 normalized.append(norm)
             except Exception as e:
-                logger.error(f"Normalization failed {f_path}: {e}")
+                logger.error(f"Normalization failed {video_path}: {e}")
 
         if not normalized:
             return
@@ -298,16 +394,33 @@ def process_batch(file_paths):  # file_paths: list of tuples (path, event_id, de
 
         merged_size_mb = os.path.getsize(merged) / (1024 * 1024)
         if merged_size_mb <= MAX_SAFE_SIZE_MB:
-            final = SEND_DIR / f"{merged.stem}.mp4"
-            shutil.move(str(merged), str(final))
-            os.chmod(final, 0o664)
+            # Одно видео – перемещаем в send
+            final_video = SEND_DIR / f"{merged.stem}.mp4"
+            shutil.move(str(merged), str(final_video))
+            os.chmod(final_video, 0o664)
 
-            if send_telegram_video(final, final_description):
-                final.unlink(missing_ok=True)
-                logger.info(f"Sent and deleted: {final.name}")
+            # Если есть snapshot, копируем его в send
+            final_snapshot = None
+            if first_snapshot:
+                final_snapshot = SEND_DIR / f"{merged.stem}.jpg"
+                shutil.copy2(str(first_snapshot), str(final_snapshot))
+                os.chmod(final_snapshot, 0o664)
+
+            # Отправка
+            if final_snapshot:
+                ok = send_telegram_media_group(final_video, final_snapshot, final_description)
             else:
-                logger.error(f"Failed to send {final.name}, keeping file")
+                ok = send_telegram_video(final_video, final_description)
+
+            if ok:
+                final_video.unlink(missing_ok=True)
+                if final_snapshot:
+                    final_snapshot.unlink(missing_ok=True)
+                logger.info(f"Sent and deleted: {final_video.name}")
+            else:
+                logger.error(f"Failed to send {final_video.name}, keeping files")
         else:
+            # Разбиваем на части
             parts = split_video(merged, merged.stem)
             merged.unlink(missing_ok=True)
 
@@ -324,9 +437,13 @@ def process_batch(file_paths):  # file_paths: list of tuples (path, event_id, de
             else:
                 logger.warning(f"Some parts failed to send, kept in {SEND_DIR}")
 
-        for f_path, eid, _ in file_paths:
-            f_path.unlink(missing_ok=True)
+        # Удаляем исходные файлы (видео и snapshot)
+        for video_path, snap_path, eid, _, _ in file_paths:
+            video_path.unlink(missing_ok=True)
+            if snap_path:
+                snap_path.unlink(missing_ok=True)
             event_descriptions.pop(eid, None)
+            event_faces.pop(eid, None)
 
     finally:
         if temp_dir.exists():
@@ -343,13 +460,14 @@ def worker_loop():
         if not data.get("after", {}).get("id"):
             continue
         eid, cam, ts = data["after"]["id"], data["after"]["camera"], data["after"]["start_time"]
-        f = download_clip(eid, cam, ts)
-        if f:
-            # Получаем описание из словаря (если уже есть)
+        video_path, snap_path = download_clip(eid, cam, ts)
+        if video_path:
             raw_desc = event_descriptions.get(eid, "")
             if raw_desc:
                 raw_desc = translate_to_russian(raw_desc)
-            session_files.append((f, eid, raw_desc))
+            face_info = event_faces.get(eid, {})
+            person_name = face_info.get("name", "")
+            session_files.append((video_path, snap_path, eid, raw_desc, person_name))
 
         # Ожидание новых событий
         while True:
@@ -360,22 +478,29 @@ def worker_loop():
             try:
                 next_data = event_queue.get(timeout=GROUP_TIMEOUT)
                 neid, ncam, nts = next_data["after"]["id"], next_data["after"]["camera"], next_data["after"]["start_time"]
-                nf = download_clip(neid, ncam, nts)
-                if nf:
+                nvideo, nsnap = download_clip(neid, ncam, nts)
+                if nvideo:
                     raw_ndesc = event_descriptions.get(neid, "")
                     if raw_ndesc:
                         raw_ndesc = translate_to_russian(raw_ndesc)
-                    session_files.append((nf, neid, raw_ndesc))
+                    nface_info = event_faces.get(neid, {})
+                    nperson_name = nface_info.get("name", "")
+                    session_files.append((nvideo, nsnap, neid, raw_ndesc, nperson_name))
             except queue.Empty:
-                # Таймаут истёк — новых событий нет
                 break
 
-        # Обновляем описания из словаря на случай, если пришли после таймаута, но до обработки
-        for i, (fpath, eid, desc) in enumerate(session_files):
+        # Обновляем описания и имена из словарей, если пришли после таймаута
+        for i, (vpath, spath, eid, desc, person) in enumerate(session_files):
+            updated = False
             if not desc and eid in event_descriptions:
-                translated = translate_to_russian(event_descriptions[eid])
-                session_files[i] = (fpath, eid, translated)
-                logger.info(f"Updated and translated description for event {eid}")
+                desc = translate_to_russian(event_descriptions[eid])
+                updated = True
+            if not person and eid in event_faces:
+                person = event_faces[eid]["name"]
+                updated = True
+            if updated:
+                session_files[i] = (vpath, spath, eid, desc, person)
+                logger.info(f"Updated info for event {eid}")
 
         if session_files:
             process_batch(session_files)
@@ -399,23 +524,35 @@ def on_message(client, userdata, msg):
 
         elif msg.topic == MQTT_TOPIC_DESCR:
             data = json.loads(msg.payload.decode())
+
+            # Обработка описаний от GenAI
             if data.get("type") == "description":
                 event_id = data.get("id")
                 description = data.get("description")
                 if event_id and description:
                     event_descriptions[event_id] = description
                     logger.info(f"Stored description for event {event_id}: {description}")
+
+            # Обработка распознанных лиц
+            elif data.get("type") == "face":
+                event_id = data.get("id")
+                name = data.get("name")
+                score = data.get("score", 0)
+                if event_id and name and score >= FACE_CONFIDENCE_THRESHOLD:
+                    event_faces[event_id] = {"name": name, "score": score}
+                    logger.info(f"Face recognized for event {event_id}: {name} (confidence: {score:.2f})")
+
     except Exception as e:
         logger.error(f"MQTT error: {e}")
 
 # ========== MAIN ==========
 def main():
-    # Проверка файлов при старте
+    # Обработка старых файлов при старте
     initial = list(NEW_DIR.glob("*.mp4"))
     if initial:
         logger.info(f"Startup: {len(initial)} files found → force merge")
-        # Для старых файлов описаний нет, используем пустые
-        fake_list = [(p, "", "") for p in initial]
+        # У старых файлов нет snapshot'ов и описаний/имён
+        fake_list = [(p, None, "", "", "") for p in initial]
         threading.Thread(target=lambda: process_batch(fake_list), daemon=True).start()
 
     threading.Thread(target=worker_loop, daemon=True).start()
