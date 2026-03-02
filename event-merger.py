@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-event-merger.py — объединяет клипы Frigate.
-Использует архитектуру очереди + умную нормализацию + подхватывает описания GenAI.
+event-merger.py — объединяет клипы Frigate и отправляет в Telegram через прокси.
+Конфигурация вынесена в отдельный файл config.py
 """
 
 import os
@@ -18,36 +18,14 @@ from pathlib import Path
 import requests
 import paho.mqtt.client as mqtt
 
-# ========== КОНФИГ ==========
-FRIGATE_API_URL = "http://192.168.0.226:5000"
-MQTT_BROKER = "192.168.0.226"
-MQTT_TOPIC = "frigate/events"
-MQTT_TOPIC_DESCR = "frigate/tracked_object_update"  # топик для описаний
-MQTT_PORT = 1883
-MQTT_USER = "frigate"
-MQTT_PASS = "frigate"
+# ========== ИМПОРТ КОНФИГУРАЦИИ ==========
+from config import *
 
-BASE_DIR = Path("/config")
-NEW_DIR = BASE_DIR / "new_event"
-SEND_DIR = BASE_DIR / "send"
-TEMP_DIR = BASE_DIR / "temp_merge"
-
-GROUP_TIMEOUT = 60          # ожидание новых событий (сек)
-MAX_FILES = 10              # принудительное слияние при достижении
-MAX_DOWNLOAD_ATTEMPTS = 4   # количество попыток скачивания
-DOWNLOAD_RETRY_DELAY = 15   # пауза между попытками (сек)
-MAX_SAFE_SIZE_MB = 45       # максимальный размер неразбитого видео
-TARGET_SEGMENT_MB = 32      # целевой размер сегмента при разбиении
-MAX_SEGMENT_BYTES = TARGET_SEGMENT_MB * 1024 * 1024
-DESCRIPTION_TIMEOUT = 40    # секунд ожидания описания от GenAI
-
-# Настройка логов
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    stream=sys.stdout
-)
-logger = logging.getLogger("event-merger")
+# ========== ПУТИ (теперь как Path) ==========
+BASE_PATH = Path(BASE_DIR)
+NEW_DIR = BASE_PATH / "new_event"
+SEND_DIR = BASE_PATH / "send"
+TEMP_DIR = BASE_PATH / "temp_merge"
 
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
 NEW_DIR.mkdir(parents=True, exist_ok=True)
@@ -56,7 +34,15 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 event_queue = queue.Queue()
 merge_lock = threading.Lock()
-event_descriptions = {}      # словарь {event_id: описание}
+event_descriptions = {}
+
+# ========== ЛОГГЕР ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
+logger = logging.getLogger("event-merger")
 
 # ========== УТИЛИТЫ ==========
 def has_audio_stream(path):
@@ -90,6 +76,35 @@ def run_ffmpeg(cmd, timeout=300):
     except Exception as e:
         logger.error(f"FFmpeg failed: {e}")
         raise
+
+def send_telegram_video(file_path, caption):
+    """Отправляет видео в Telegram через прокси (если настроено)."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
+
+    proxies = None
+    if TELEGRAM_PROXY_HOST and TELEGRAM_PROXY_PORT:
+        proxy_auth = ""
+        if TELEGRAM_PROXY_USER and TELEGRAM_PROXY_PASS:
+            proxy_auth = f"{TELEGRAM_PROXY_USER}:{TELEGRAM_PROXY_PASS}@"
+        proxy_url = f"{TELEGRAM_PROXY_TYPE}://{proxy_auth}{TELEGRAM_PROXY_HOST}:{TELEGRAM_PROXY_PORT}"
+        proxies = {"http": proxy_url, "https": proxy_url}
+        logger.info(f"Using proxy: {TELEGRAM_PROXY_TYPE}://{TELEGRAM_PROXY_HOST}:{TELEGRAM_PROXY_PORT}")
+
+    for attempt in range(1, TELEGRAM_RETRY_ATTEMPTS + 1):
+        try:
+            with open(file_path, 'rb') as video_file:
+                files = {'video': video_file}
+                data = {'chat_id': TELEGRAM_CHAT_ID, 'caption': caption}
+                response = requests.post(url, files=files, data=data, timeout=60, proxies=proxies)
+                response.raise_for_status()
+                logger.info(f"Telegram send success: {file_path.name}")
+                return True
+        except Exception as e:
+            logger.warning(f"Telegram send attempt {attempt} failed: {e}")
+            if attempt < TELEGRAM_RETRY_ATTEMPTS:
+                time.sleep(TELEGRAM_RETRY_DELAY)
+    logger.error(f"Failed to send {file_path.name} after {TELEGRAM_RETRY_ATTEMPTS} attempts")
+    return False
 
 # ========== НОРМАЛИЗАЦИЯ ==========
 def normalize_video(input_path, output_path):
@@ -177,16 +192,14 @@ def split_video(input_path, prefix):
     return parts
 
 # ========== ОБРАБОТКА ПАЧКИ ==========
-def process_batch(file_paths):   # file_paths: list of tuples (path, event_id, description)
+def process_batch(file_paths):
     if not file_paths:
         return
 
     logger.info(f"Processing batch of {len(file_paths)} files")
 
-    # Собираем все непустые описания из пачки
     descriptions = [desc for _, _, desc in file_paths if desc]
     if descriptions:
-        # используем первое описание (можно объединить, если нужно)
         final_description = descriptions[0]
     else:
         final_description = "Обнаружено движение"
@@ -214,7 +227,6 @@ def process_batch(file_paths):   # file_paths: list of tuples (path, event_id, d
 
         merged = NEW_DIR / f"merged_{int(time.time())}.mp4"
 
-        # Конкатенация с единым битрейтом 2M
         concat_cmd = [
             "ffmpeg", "-f", "concat", "-safe", "0", "-i", str(list_file),
             "-c:v", "h264_nvenc", "-preset", "p5",
@@ -229,36 +241,36 @@ def process_batch(file_paths):   # file_paths: list of tuples (path, event_id, d
 
         run_ffmpeg(concat_cmd)
 
-        # Проверка размера итогового видео
         merged_size_mb = os.path.getsize(merged) / (1024 * 1024)
         if merged_size_mb <= MAX_SAFE_SIZE_MB:
-            # Если видео небольшое – просто перемещаем в send
             final = SEND_DIR / f"{merged.stem}.mp4"
             shutil.move(str(merged), str(final))
             os.chmod(final, 0o664)
 
-            # Сохраняем описание в отдельный txt-файл
-            desc_file = SEND_DIR / f"{merged.stem}.txt"
-            with open(desc_file, "w") as df:
-                df.write(final_description)
-            os.chmod(desc_file, 0o664)
-            logger.info(f"Merged video moved to send: {final.name}, description saved")
+            if send_telegram_video(final, final_description):
+                final.unlink(missing_ok=True)
+                logger.info(f"Sent and deleted: {final.name}")
+            else:
+                logger.error(f"Failed to send {final.name}, keeping file")
         else:
-            # Иначе разбиваем на части
             parts = split_video(merged, merged.stem)
             merged.unlink(missing_ok=True)
 
-            # Сохраняем описание один раз для всех частей
-            desc_file = SEND_DIR / f"{merged.stem}.txt"
-            with open(desc_file, "w") as df:
-                df.write(final_description)
-            os.chmod(desc_file, 0o664)
-            logger.info(f"Split into {len(parts)} parts, description saved")
+            all_sent = True
+            for part in parts:
+                if send_telegram_video(part, final_description):
+                    part.unlink(missing_ok=True)
+                else:
+                    all_sent = False
+                    logger.error(f"Failed to send {part.name}, keeping file")
 
-        # Удаляем исходные скачанные файлы
+            if all_sent:
+                logger.info(f"All {len(parts)} parts sent and deleted")
+            else:
+                logger.warning(f"Some parts failed to send, kept in {SEND_DIR}")
+
         for f_path, eid, _ in file_paths:
             f_path.unlink(missing_ok=True)
-            # Удаляем описание из словаря (больше не нужно)
             event_descriptions.pop(eid, None)
 
     finally:
@@ -271,14 +283,12 @@ def worker_loop():
     while True:
         session_files = []
 
-        # Первое событие
         data = event_queue.get()
         if not data.get("after", {}).get("id"):
             continue
         eid, cam, ts = data["after"]["id"], data["after"]["camera"], data["after"]["start_time"]
         f = download_clip(eid, cam, ts)
         if f:
-            # Ждём описание до DESCRIPTION_TIMEOUT секунд
             desc = None
             for _ in range(DESCRIPTION_TIMEOUT):
                 if eid in event_descriptions:
@@ -290,7 +300,6 @@ def worker_loop():
                 logger.warning(f"No description for event {eid} within timeout")
             session_files.append((f, eid, desc))
 
-        # Ожидание новых событий
         while True:
             if len(session_files) >= MAX_FILES:
                 logger.info(f"File count limit reached ({MAX_FILES}), forcing merge")
@@ -314,7 +323,6 @@ def worker_loop():
             except queue.Empty:
                 break
 
-        # Обновляем описания из словаря (на случай, если пришли после таймаута, но до обработки)
         for i, (fpath, eid, desc) in enumerate(session_files):
             if not desc and eid in event_descriptions:
                 session_files[i] = (fpath, eid, event_descriptions[eid])

@@ -10,7 +10,8 @@ RUN apt-get update && \
     && \
     rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --no-cache-dir paho-mqtt requests
+#RUN pip3 install --no-cache-dir paho-mqtt requests
+RUN pip3 install --no-cache-dir 'requests[socks]' paho-mqtt
 
 WORKDIR /app
 COPY event-merger.py .
