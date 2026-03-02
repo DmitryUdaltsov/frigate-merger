@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-event-merger.py — объединяет клипы Frigate и отправляет в Telegram через прокси.
+event-merger.py — объединяет клипы Frigate, отправляет в Telegram через прокси,
+переводит описания с английского на русский (опционально).
 Конфигурация вынесена в отдельный файл config.py
 """
 
@@ -21,11 +22,11 @@ import paho.mqtt.client as mqtt
 # ========== ИМПОРТ КОНФИГУРАЦИИ ==========
 from config import *
 
-# ========== ПУТИ (теперь как Path) ==========
-BASE_PATH = Path(BASE_DIR)
-NEW_DIR = BASE_PATH / "new_event"
-SEND_DIR = BASE_PATH / "send"
-TEMP_DIR = BASE_PATH / "temp_merge"
+# ========== ПУТИ ==========
+base_path = Path(BASE_DIR)
+NEW_DIR = base_path / "new_event"
+SEND_DIR = base_path / "send"
+TEMP_DIR = base_path / "temp_merge"
 
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
 NEW_DIR.mkdir(parents=True, exist_ok=True)
@@ -76,6 +77,60 @@ def run_ffmpeg(cmd, timeout=300):
     except Exception as e:
         logger.error(f"FFmpeg failed: {e}")
         raise
+
+def translate_to_russian(text):
+    """Переводит английский текст на русский через Ollama (если включено)."""
+    if not TRANSLATE_TO_RUSSIAN or not text:
+        return text
+
+    # Если текст уже содержит кириллицу, не переводим
+    if any('\u0400' <= c <= '\u04FF' for c in text):
+        logger.debug("Text already contains Cyrillic, skipping translation")
+        return text
+
+    if len(text) < 3:
+        return text
+
+    # Несколько вариантов промпта для повышения шанса успеха
+    prompts = [
+        f"""Translate the following text from English to Russian. Provide only the translation, no additional text.
+
+Text: {text}
+
+Russian translation:""",
+        f"""Переведи следующий текст с английского на русский. Только перевод, без пояснений.
+
+{text}"""
+    ]
+
+    for prompt in prompts:
+        try:
+            response = requests.post(
+                f"{OLLAMA_API_URL}/api/generate",
+                json={
+                    "model": TRANSLATION_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,
+                        "num_predict": 512
+                    }
+                },
+                timeout=TRANSLATION_TIMEOUT
+            )
+            response.raise_for_status()
+            result = response.json().get("response", "").strip()
+            result = result.replace('"', '').strip()
+
+            if result:
+                logger.info(f"Translated: '{text[:30]}...' -> '{result[:30]}...'")
+                return result
+        except Exception as e:
+            logger.warning(f"Translation attempt with prompt #{prompts.index(prompt)+1} failed: {e}")
+            continue
+
+    logger.error(f"All translation attempts failed for: {text[:50]}...")
+    return text  # возвращаем оригинал
 
 def send_telegram_video(file_path, caption):
     """Отправляет видео в Telegram через прокси (если настроено)."""
@@ -192,7 +247,7 @@ def split_video(input_path, prefix):
     return parts
 
 # ========== ОБРАБОТКА ПАЧКИ ==========
-def process_batch(file_paths):
+def process_batch(file_paths):  # file_paths: list of tuples (path, event_id, description)
     if not file_paths:
         return
 
@@ -283,23 +338,20 @@ def worker_loop():
     while True:
         session_files = []
 
+        # Первое событие
         data = event_queue.get()
         if not data.get("after", {}).get("id"):
             continue
         eid, cam, ts = data["after"]["id"], data["after"]["camera"], data["after"]["start_time"]
         f = download_clip(eid, cam, ts)
         if f:
-            desc = None
-            for _ in range(DESCRIPTION_TIMEOUT):
-                if eid in event_descriptions:
-                    desc = event_descriptions[eid]
-                    break
-                time.sleep(1)
-            if desc is None:
-                desc = ""
-                logger.warning(f"No description for event {eid} within timeout")
-            session_files.append((f, eid, desc))
+            # Получаем описание из словаря (если уже есть)
+            raw_desc = event_descriptions.get(eid, "")
+            if raw_desc:
+                raw_desc = translate_to_russian(raw_desc)
+            session_files.append((f, eid, raw_desc))
 
+        # Ожидание новых событий
         while True:
             if len(session_files) >= MAX_FILES:
                 logger.info(f"File count limit reached ({MAX_FILES}), forcing merge")
@@ -310,23 +362,20 @@ def worker_loop():
                 neid, ncam, nts = next_data["after"]["id"], next_data["after"]["camera"], next_data["after"]["start_time"]
                 nf = download_clip(neid, ncam, nts)
                 if nf:
-                    ndesc = None
-                    for _ in range(DESCRIPTION_TIMEOUT):
-                        if neid in event_descriptions:
-                            ndesc = event_descriptions[neid]
-                            break
-                        time.sleep(1)
-                    if ndesc is None:
-                        ndesc = ""
-                        logger.warning(f"No description for event {neid} within timeout")
-                    session_files.append((nf, neid, ndesc))
+                    raw_ndesc = event_descriptions.get(neid, "")
+                    if raw_ndesc:
+                        raw_ndesc = translate_to_russian(raw_ndesc)
+                    session_files.append((nf, neid, raw_ndesc))
             except queue.Empty:
+                # Таймаут истёк — новых событий нет
                 break
 
+        # Обновляем описания из словаря на случай, если пришли после таймаута, но до обработки
         for i, (fpath, eid, desc) in enumerate(session_files):
             if not desc and eid in event_descriptions:
-                session_files[i] = (fpath, eid, event_descriptions[eid])
-                logger.info(f"Updated description for event {eid} just before processing")
+                translated = translate_to_russian(event_descriptions[eid])
+                session_files[i] = (fpath, eid, translated)
+                logger.info(f"Updated and translated description for event {eid}")
 
         if session_files:
             process_batch(session_files)
@@ -361,9 +410,11 @@ def on_message(client, userdata, msg):
 
 # ========== MAIN ==========
 def main():
+    # Проверка файлов при старте
     initial = list(NEW_DIR.glob("*.mp4"))
     if initial:
         logger.info(f"Startup: {len(initial)} files found → force merge")
+        # Для старых файлов описаний нет, используем пустые
         fake_list = [(p, "", "") for p in initial]
         threading.Thread(target=lambda: process_batch(fake_list), daemon=True).start()
 
