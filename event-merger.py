@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 event-merger.py — объединяет клипы Frigate.
-Использует архитектуру очереди + умную нормализацию.
+Использует архитектуру очереди + умную нормализацию + подхватывает описания GenAI.
 """
 
 import os
@@ -22,6 +22,7 @@ import paho.mqtt.client as mqtt
 FRIGATE_API_URL = "http://192.168.0.226:5000"
 MQTT_BROKER = "192.168.0.226"
 MQTT_TOPIC = "frigate/events"
+MQTT_TOPIC_DESCR = "frigate/tracked_object_update"  # топик для описаний
 MQTT_PORT = 1883
 MQTT_USER = "frigate"
 MQTT_PASS = "frigate"
@@ -38,6 +39,7 @@ DOWNLOAD_RETRY_DELAY = 15   # пауза между попытками (сек)
 MAX_SAFE_SIZE_MB = 45       # максимальный размер неразбитого видео
 TARGET_SEGMENT_MB = 32      # целевой размер сегмента при разбиении
 MAX_SEGMENT_BYTES = TARGET_SEGMENT_MB * 1024 * 1024
+DESCRIPTION_TIMEOUT = 40    # секунд ожидания описания от GenAI
 
 # Настройка логов
 logging.basicConfig(
@@ -54,6 +56,7 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 event_queue = queue.Queue()
 merge_lock = threading.Lock()
+event_descriptions = {}      # словарь {event_id: описание}
 
 # ========== УТИЛИТЫ ==========
 def has_audio_stream(path):
@@ -174,23 +177,32 @@ def split_video(input_path, prefix):
     return parts
 
 # ========== ОБРАБОТКА ПАЧКИ ==========
-def process_batch(file_paths):
+def process_batch(file_paths):   # file_paths: list of tuples (path, event_id, description)
     if not file_paths:
         return
 
     logger.info(f"Processing batch of {len(file_paths)} files")
+
+    # Собираем все непустые описания из пачки
+    descriptions = [desc for _, _, desc in file_paths if desc]
+    if descriptions:
+        # используем первое описание (можно объединить, если нужно)
+        final_description = descriptions[0]
+    else:
+        final_description = "Обнаружено движение"
+
     temp_dir = TEMP_DIR / f"batch_{int(time.time())}"
     temp_dir.mkdir(exist_ok=True)
 
     try:
         normalized = []
-        for i, f in enumerate(file_paths):
+        for i, (f_path, eid, desc) in enumerate(file_paths):
             norm = temp_dir / f"norm_{i:03d}.mp4"
             try:
-                normalize_video(f, norm)
+                normalize_video(f_path, norm)
                 normalized.append(norm)
             except Exception as e:
-                logger.error(f"Normalization failed {f}: {e}")
+                logger.error(f"Normalization failed {f_path}: {e}")
 
         if not normalized:
             return
@@ -224,16 +236,30 @@ def process_batch(file_paths):
             final = SEND_DIR / f"{merged.stem}.mp4"
             shutil.move(str(merged), str(final))
             os.chmod(final, 0o664)
-            logger.info(f"Merged video moved to send: {final.name}")
+
+            # Сохраняем описание в отдельный txt-файл
+            desc_file = SEND_DIR / f"{merged.stem}.txt"
+            with open(desc_file, "w") as df:
+                df.write(final_description)
+            os.chmod(desc_file, 0o664)
+            logger.info(f"Merged video moved to send: {final.name}, description saved")
         else:
             # Иначе разбиваем на части
             parts = split_video(merged, merged.stem)
             merged.unlink(missing_ok=True)
-            logger.info(f"Split into {len(parts)} parts")
+
+            # Сохраняем описание один раз для всех частей
+            desc_file = SEND_DIR / f"{merged.stem}.txt"
+            with open(desc_file, "w") as df:
+                df.write(final_description)
+            os.chmod(desc_file, 0o664)
+            logger.info(f"Split into {len(parts)} parts, description saved")
 
         # Удаляем исходные скачанные файлы
-        for f in file_paths:
-            f.unlink(missing_ok=True)
+        for f_path, eid, _ in file_paths:
+            f_path.unlink(missing_ok=True)
+            # Удаляем описание из словаря (больше не нужно)
+            event_descriptions.pop(eid, None)
 
     finally:
         if temp_dir.exists():
@@ -252,11 +278,20 @@ def worker_loop():
         eid, cam, ts = data["after"]["id"], data["after"]["camera"], data["after"]["start_time"]
         f = download_clip(eid, cam, ts)
         if f:
-            session_files.append(f)
+            # Ждём описание до DESCRIPTION_TIMEOUT секунд
+            desc = None
+            for _ in range(DESCRIPTION_TIMEOUT):
+                if eid in event_descriptions:
+                    desc = event_descriptions[eid]
+                    break
+                time.sleep(1)
+            if desc is None:
+                desc = ""
+                logger.warning(f"No description for event {eid} within timeout")
+            session_files.append((f, eid, desc))
 
         # Ожидание новых событий
         while True:
-            # Проверка лимита файлов (принудительное слияние)
             if len(session_files) >= MAX_FILES:
                 logger.info(f"File count limit reached ({MAX_FILES}), forcing merge")
                 break
@@ -266,10 +301,24 @@ def worker_loop():
                 neid, ncam, nts = next_data["after"]["id"], next_data["after"]["camera"], next_data["after"]["start_time"]
                 nf = download_clip(neid, ncam, nts)
                 if nf:
-                    session_files.append(nf)
+                    ndesc = None
+                    for _ in range(DESCRIPTION_TIMEOUT):
+                        if neid in event_descriptions:
+                            ndesc = event_descriptions[neid]
+                            break
+                        time.sleep(1)
+                    if ndesc is None:
+                        ndesc = ""
+                        logger.warning(f"No description for event {neid} within timeout")
+                    session_files.append((nf, neid, ndesc))
             except queue.Empty:
-                # Таймаут истёк — новых событий нет
                 break
+
+        # Обновляем описания из словаря (на случай, если пришли после таймаута, но до обработки)
+        for i, (fpath, eid, desc) in enumerate(session_files):
+            if not desc and eid in event_descriptions:
+                session_files[i] = (fpath, eid, event_descriptions[eid])
+                logger.info(f"Updated description for event {eid} just before processing")
 
         if session_files:
             process_batch(session_files)
@@ -279,25 +328,36 @@ def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         logger.info("Connected to MQTT")
         client.subscribe(MQTT_TOPIC)
+        client.subscribe(MQTT_TOPIC_DESCR)
     else:
         logger.error(f"MQTT connect failed: {rc}")
 
 def on_message(client, userdata, msg):
     try:
-        data = json.loads(msg.payload.decode())
-        logger.debug(f"MQTT: {data.get('type')} {data.get('after',{}).get('camera')}")
-        if data.get("type") == "end":
-            event_queue.put(data)
+        if msg.topic == MQTT_TOPIC:
+            data = json.loads(msg.payload.decode())
+            logger.debug(f"MQTT event: {data.get('type')} {data.get('after',{}).get('camera')}")
+            if data.get("type") == "end":
+                event_queue.put(data)
+
+        elif msg.topic == MQTT_TOPIC_DESCR:
+            data = json.loads(msg.payload.decode())
+            if data.get("type") == "description":
+                event_id = data.get("id")
+                description = data.get("description")
+                if event_id and description:
+                    event_descriptions[event_id] = description
+                    logger.info(f"Stored description for event {event_id}: {description}")
     except Exception as e:
         logger.error(f"MQTT error: {e}")
 
 # ========== MAIN ==========
 def main():
-    # Проверка файлов при старте
     initial = list(NEW_DIR.glob("*.mp4"))
     if initial:
         logger.info(f"Startup: {len(initial)} files found → force merge")
-        threading.Thread(target=lambda: process_batch(initial), daemon=True).start()
+        fake_list = [(p, "", "") for p in initial]
+        threading.Thread(target=lambda: process_batch(fake_list), daemon=True).start()
 
     threading.Thread(target=worker_loop, daemon=True).start()
 
