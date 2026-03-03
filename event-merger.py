@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-event-merger.py — объединяет клипы Frigate, отправляет в Telegram с фото и видео,
-переводит описания на русский, добавляет имена распознанных лиц.
-Конфигурация в config.py.
+event-merger.py — объединяет клипы Frigate, отправляет в Telegram (основной и дополнительный чаты),
+переводит описания на русский, добавляет имя распознанного лица.
+Конфигурация в config.py
 """
 
 import os
@@ -20,11 +20,7 @@ import requests
 import paho.mqtt.client as mqtt
 
 # ========== ИМПОРТ КОНФИГУРАЦИИ ==========
-try:
-    from config import *
-except ImportError:
-    print("ERROR: config.py not found. Please create config.py with required settings.")
-    sys.exit(1)
+from config import *
 
 # ========== ПУТИ ==========
 base_path = Path(BASE_DIR)
@@ -39,8 +35,8 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 event_queue = queue.Queue()
 merge_lock = threading.Lock()
-event_descriptions = {}          # словарь {event_id: описание}
-event_faces = {}                 # словарь {event_id: {"name": имя, "score": уверенность}}
+event_descriptions = {}
+event_faces = {}  # {event_id: {"name": str, "score": float}}
 
 # ========== ЛОГГЕР ==========
 logging.basicConfig(
@@ -88,7 +84,6 @@ def translate_to_russian(text):
     if not TRANSLATE_TO_RUSSIAN or not text:
         return text
 
-    # Если текст уже содержит кириллицу, не переводим
     if any('\u0400' <= c <= '\u04FF' for c in text):
         return text
 
@@ -134,18 +129,20 @@ Russian translation:""",
     logger.error(f"All translation attempts failed for: {text[:50]}...")
     return text
 
-def send_telegram_media_group(video_path, photo_path, caption):
-    """Отправляет фото и видео как группу медиа в Telegram."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup"
-
-    proxies = None
+def get_proxies():
+    """Возвращает словарь прокси для requests, если настроено."""
     if TELEGRAM_PROXY_HOST and TELEGRAM_PROXY_PORT:
         proxy_auth = ""
         if TELEGRAM_PROXY_USER and TELEGRAM_PROXY_PASS:
             proxy_auth = f"{TELEGRAM_PROXY_USER}:{TELEGRAM_PROXY_PASS}@"
         proxy_url = f"{TELEGRAM_PROXY_TYPE}://{proxy_auth}{TELEGRAM_PROXY_HOST}:{TELEGRAM_PROXY_PORT}"
-        proxies = {"http": proxy_url, "https": proxy_url}
-        logger.info(f"Using proxy: {TELEGRAM_PROXY_TYPE}://{TELEGRAM_PROXY_HOST}:{TELEGRAM_PROXY_PORT}")
+        return {"http": proxy_url, "https": proxy_url}
+    return None
+
+def send_telegram_media_group(video_path, photo_path, caption, chat_id, bot_token):
+    """Отправляет фото и видео как группу медиа в указанный чат."""
+    url = f"https://api.telegram.org/bot{bot_token}/sendMediaGroup"
+    proxies = get_proxies()
 
     media = []
     files = {}
@@ -154,7 +151,7 @@ def send_telegram_media_group(video_path, photo_path, caption):
             media.append({
                 'type': 'photo',
                 'media': 'attach://photo',
-                'caption': caption,
+                'caption': caption,  # подпись прикрепляется к фото
             })
             files['photo'] = open(photo_path, 'rb')
         media.append({
@@ -164,7 +161,7 @@ def send_telegram_media_group(video_path, photo_path, caption):
         files['video'] = open(video_path, 'rb')
 
         payload = {
-            'chat_id': TELEGRAM_CHAT_ID,
+            'chat_id': chat_id,
             'media': json.dumps(media)
         }
 
@@ -172,10 +169,10 @@ def send_telegram_media_group(video_path, photo_path, caption):
             try:
                 response = requests.post(url, data=payload, files=files, timeout=60, proxies=proxies)
                 response.raise_for_status()
-                logger.info(f"Media group sent: {video_path.name}")
+                logger.info(f"Media group sent to {chat_id}: {video_path.name}")
                 return True
             except Exception as e:
-                logger.warning(f"Media group attempt {attempt} failed: {e}")
+                logger.warning(f"Media group attempt {attempt} to {chat_id} failed: {e}")
                 if attempt < TELEGRAM_RETRY_ATTEMPTS:
                     time.sleep(TELEGRAM_RETRY_DELAY)
         return False
@@ -183,32 +180,25 @@ def send_telegram_media_group(video_path, photo_path, caption):
         for f in files.values():
             f.close()
 
-def send_telegram_video(video_path, caption):
-    """Отправляет только видео (запасной вариант)."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
-
-    proxies = None
-    if TELEGRAM_PROXY_HOST and TELEGRAM_PROXY_PORT:
-        proxy_auth = ""
-        if TELEGRAM_PROXY_USER and TELEGRAM_PROXY_PASS:
-            proxy_auth = f"{TELEGRAM_PROXY_USER}:{TELEGRAM_PROXY_PASS}@"
-        proxy_url = f"{TELEGRAM_PROXY_TYPE}://{proxy_auth}{TELEGRAM_PROXY_HOST}:{TELEGRAM_PROXY_PORT}"
-        proxies = {"http": proxy_url, "https": proxy_url}
+def send_telegram_video(video_path, caption, chat_id, bot_token):
+    """Отправляет только видео в указанный чат."""
+    url = f"https://api.telegram.org/bot{bot_token}/sendVideo"
+    proxies = get_proxies()
 
     for attempt in range(1, TELEGRAM_RETRY_ATTEMPTS + 1):
         try:
             with open(video_path, 'rb') as video_file:
                 files = {'video': video_file}
-                data = {'chat_id': TELEGRAM_CHAT_ID, 'caption': caption}
+                data = {'chat_id': chat_id, 'caption': caption}
                 response = requests.post(url, files=files, data=data, timeout=60, proxies=proxies)
                 response.raise_for_status()
-                logger.info(f"Video sent: {video_path.name}")
+                logger.info(f"Video sent to {chat_id}: {video_path.name}")
                 return True
         except Exception as e:
-            logger.warning(f"Video send attempt {attempt} failed: {e}")
+            logger.warning(f"Video send attempt {attempt} to {chat_id} failed: {e}")
             if attempt < TELEGRAM_RETRY_ATTEMPTS:
                 time.sleep(TELEGRAM_RETRY_DELAY)
-    logger.error(f"Failed to send {video_path.name} after {TELEGRAM_RETRY_ATTEMPTS} attempts")
+    logger.error(f"Failed to send {video_path.name} to {chat_id} after {TELEGRAM_RETRY_ATTEMPTS} attempts")
     return False
 
 # ========== НОРМАЛИЗАЦИЯ ==========
@@ -273,7 +263,7 @@ def download_clip(event_id, camera, start_time):
             if r.status_code == 200:
                 with open(snapshot_path, "wb") as f:
                     f.write(r.content)
-                if os.path.getsize(snapshot_path) > 1000:  # не пустой
+                if os.path.getsize(snapshot_path) > 1000:
                     os.chmod(snapshot_path, 0o664)
                     snapshot_ok = True
                     break
@@ -342,9 +332,9 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
     descriptions = [desc for _, _, _, desc, _ in file_paths if desc]
     person_names = [name for _, _, _, _, name in file_paths if name]
 
-    # Формируем финальную подпись
+    # Формируем финальную подпись для основного чата
     if INCLUDE_FACE_NAME and person_names:
-        main_person = person_names[0]  # берём первое имя (обычно главное событие)
+        main_person = person_names[0]
         if descriptions:
             final_description = f"{main_person}: {descriptions[0]}"
         else:
@@ -393,6 +383,8 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
         run_ffmpeg(concat_cmd)
 
         merged_size_mb = os.path.getsize(merged) / (1024 * 1024)
+
+        # --- Основная отправка (с подписью) ---
         if merged_size_mb <= MAX_SAFE_SIZE_MB:
             # Одно видео – перемещаем в send
             final_video = SEND_DIR / f"{merged.stem}.mp4"
@@ -406,13 +398,34 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
                 shutil.copy2(str(first_snapshot), str(final_snapshot))
                 os.chmod(final_snapshot, 0o664)
 
-            # Отправка
+            # Отправка в основной чат
             if final_snapshot:
-                ok = send_telegram_media_group(final_video, final_snapshot, final_description)
+                ok = send_telegram_media_group(
+                    final_video, final_snapshot, final_description,
+                    TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN
+                )
             else:
-                ok = send_telegram_video(final_video, final_description)
+                ok = send_telegram_video(
+                    final_video, final_description,
+                    TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN
+                )
 
             if ok:
+                # Отправка во второй чат (без подписи)
+                if SECOND_TELEGRAM_CHAT_ID:
+                    if final_snapshot:
+                        send_telegram_media_group(
+                            final_video, final_snapshot, "",  # пустая подпись
+                            SECOND_TELEGRAM_CHAT_ID,
+                            SECOND_TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN
+                        )
+                    else:
+                        send_telegram_video(
+                            final_video, "",
+                            SECOND_TELEGRAM_CHAT_ID,
+                            SECOND_TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN
+                        )
+                # Удаление файлов
                 final_video.unlink(missing_ok=True)
                 if final_snapshot:
                     final_snapshot.unlink(missing_ok=True)
@@ -426,7 +439,15 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
 
             all_sent = True
             for part in parts:
-                if send_telegram_video(part, final_description):
+                # Отправка в основной чат
+                if send_telegram_video(part, final_description, TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN):
+                    # Отправка во второй чат (без подписи)
+                    if SECOND_TELEGRAM_CHAT_ID:
+                        send_telegram_video(
+                            part, "",
+                            SECOND_TELEGRAM_CHAT_ID,
+                            SECOND_TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN
+                        )
                     part.unlink(missing_ok=True)
                 else:
                     all_sent = False
@@ -465,8 +486,10 @@ def worker_loop():
             raw_desc = event_descriptions.get(eid, "")
             if raw_desc:
                 raw_desc = translate_to_russian(raw_desc)
+
             face_info = event_faces.get(eid, {})
             person_name = face_info.get("name", "")
+
             session_files.append((video_path, snap_path, eid, raw_desc, person_name))
 
         # Ожидание новых событий
@@ -483,13 +506,15 @@ def worker_loop():
                     raw_ndesc = event_descriptions.get(neid, "")
                     if raw_ndesc:
                         raw_ndesc = translate_to_russian(raw_ndesc)
-                    nface_info = event_faces.get(neid, {})
-                    nperson_name = nface_info.get("name", "")
-                    session_files.append((nvideo, nsnap, neid, raw_ndesc, nperson_name))
+
+                    nface = event_faces.get(neid, {})
+                    nperson = nface.get("name", "")
+
+                    session_files.append((nvideo, nsnap, neid, raw_ndesc, nperson))
             except queue.Empty:
                 break
 
-        # Обновляем описания и имена из словарей, если пришли после таймаута
+        # Обновляем описания и имена, если пришли после таймаута
         for i, (vpath, spath, eid, desc, person) in enumerate(session_files):
             updated = False
             if not desc and eid in event_descriptions:
@@ -500,7 +525,7 @@ def worker_loop():
                 updated = True
             if updated:
                 session_files[i] = (vpath, spath, eid, desc, person)
-                logger.info(f"Updated info for event {eid}")
+                logger.info(f"Updated data for event {eid}: desc='{desc[:30]}', person='{person}'")
 
         if session_files:
             process_batch(session_files)
@@ -551,8 +576,7 @@ def main():
     initial = list(NEW_DIR.glob("*.mp4"))
     if initial:
         logger.info(f"Startup: {len(initial)} files found → force merge")
-        # У старых файлов нет snapshot'ов и описаний/имён
-        fake_list = [(p, None, "", "", "") for p in initial]
+        fake_list = [(p, None, "", "", "") for p in initial]  # без снэпшотов и данных
         threading.Thread(target=lambda: process_batch(fake_list), daemon=True).start()
 
     threading.Thread(target=worker_loop, daemon=True).start()
