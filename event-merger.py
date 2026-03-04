@@ -2,6 +2,7 @@
 """
 event-merger.py — объединяет клипы Frigate, отправляет в Telegram (основной и дополнительный чаты),
 переводит описания на русский, добавляет имя распознанного лица.
+Видео с камеры "balcony" обрабатываются отдельно и отправляются только в первый чат.
 Конфигурация в config.py
 """
 
@@ -321,7 +322,79 @@ def split_video(input_path, prefix):
 
     return parts
 
-# ========== ОБРАБОТКА ПАЧКИ ==========
+# ========== ОБРАБОТКА ОДИНОЧНОГО ВИДЕО (например, с балкона) ==========
+def process_single_video(video_path, snapshot_path, event_id, description, person_name, camera):
+    """Обработка одиночного видео (например, с балкона). Нормализация, отправка только в первый чат."""
+    logger.info(f"Processing single video from {camera}: {video_path.name}")
+
+    temp_dir = TEMP_DIR / f"single_{int(time.time())}_{camera}"
+    temp_dir.mkdir(exist_ok=True)
+
+    try:
+        # Нормализуем видео
+        norm_path = temp_dir / f"norm_{video_path.stem}.mp4"
+        try:
+            normalize_video(video_path, norm_path)
+        except Exception as e:
+            logger.error(f"Normalization failed for {video_path.name}: {e}")
+            return
+
+        # Проверяем размер нормализованного видео
+        size_mb = os.path.getsize(norm_path) / (1024 * 1024)
+
+        # Формируем подпись
+        if INCLUDE_FACE_NAME and person_name:
+            if description:
+                caption = f"{person_name}: {description}"
+            else:
+                caption = f"Обнаружен {person_name}"
+        else:
+            caption = description if description else "Обнаружено движение"
+
+        # Отправка только в первый чат (без второго)
+        if size_mb <= MAX_SAFE_SIZE_MB:
+            # Просто отправляем видео (со снэпшотом, если есть)
+            if snapshot_path and Path(snapshot_path).exists():
+                ok = send_telegram_media_group(
+                    norm_path, snapshot_path, caption,
+                    TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN
+                )
+            else:
+                ok = send_telegram_video(
+                    norm_path, caption,
+                    TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN
+                )
+            if ok:
+                logger.info(f"Single video sent: {norm_path.name}")
+                norm_path.unlink(missing_ok=True)
+            else:
+                logger.error(f"Failed to send single video {norm_path.name}, keeping in temp")
+        else:
+            # Разбиваем на части
+            parts = split_video(norm_path, f"{norm_path.stem}_part")
+            all_sent = True
+            for part in parts:
+                if send_telegram_video(part, caption, TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN):
+                    part.unlink(missing_ok=True)
+                else:
+                    all_sent = False
+                    logger.error(f"Failed to send part {part.name}, keeping")
+            if all_sent:
+                logger.info(f"All parts of single video sent")
+                norm_path.unlink(missing_ok=True)
+            else:
+                logger.warning(f"Some parts of single video failed to send")
+    finally:
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        # Удаляем исходные файлы
+        video_path.unlink(missing_ok=True)
+        if snapshot_path:
+            snapshot_path.unlink(missing_ok=True)
+        event_descriptions.pop(event_id, None)
+        event_faces.pop(event_id, None)
+
+# ========== ОБРАБОТКА ПАЧКИ ОБЫЧНЫХ ВИДЕО ==========
 def process_batch(file_paths):  # список кортежей (video_path, snapshot_path, event_id, description, person_name)
     if not file_paths:
         return
@@ -490,9 +563,15 @@ def worker_loop():
             face_info = event_faces.get(eid, {})
             person_name = face_info.get("name", "")
 
+            # Если это балкон, обрабатываем сразу и начинаем новую итерацию
+            if cam == "balcony":
+                process_single_video(video_path, snap_path, eid, raw_desc, person_name, cam)
+                continue   # переходим к следующему событию
+
+            # Иначе добавляем в обычную пачку
             session_files.append((video_path, snap_path, eid, raw_desc, person_name))
 
-        # Ожидание новых событий
+        # Ожидание новых событий (для обычных видео)
         while True:
             if len(session_files) >= MAX_FILES:
                 logger.info(f"File count limit reached ({MAX_FILES}), forcing merge")
@@ -509,6 +588,11 @@ def worker_loop():
 
                     nface = event_faces.get(neid, {})
                     nperson = nface.get("name", "")
+
+                    # Если это балкон, обрабатываем сразу и не добавляем в пачку
+                    if ncam == "balcony":
+                        process_single_video(nvideo, nsnap, neid, raw_ndesc, nperson, ncam)
+                        continue   # продолжаем ожидание других событий
 
                     session_files.append((nvideo, nsnap, neid, raw_ndesc, nperson))
             except queue.Empty:
@@ -576,6 +660,8 @@ def main():
     initial = list(NEW_DIR.glob("*.mp4"))
     if initial:
         logger.info(f"Startup: {len(initial)} files found → force merge")
+        # Для старых файлов у нас нет информации о камере, поэтому обработаем их как обычные (все вместе)
+        # Но можно попробовать определить камеру из имени файла, если нужно.
         fake_list = [(p, None, "", "", "") for p in initial]  # без снэпшотов и данных
         threading.Thread(target=lambda: process_batch(fake_list), daemon=True).start()
 
