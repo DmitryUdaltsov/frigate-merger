@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 event-merger.py — объединяет клипы Frigate, отправляет в Telegram (основной и дополнительный чаты),
-переводит описания на русский, добавляет имя распознанного лица.
+переводит описания на русский, добавляет имена распознанных лиц (несколько через запятую).
 Видео с камеры "balcony" обрабатываются отдельно и отправляются только в первый чат.
 Конфигурация в config.py
 """
@@ -37,7 +37,7 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 event_queue = queue.Queue()
 merge_lock = threading.Lock()
 event_descriptions = {}
-event_faces = {}  # {event_id: {"name": str, "score": float}}
+event_faces = {}  # {event_id: [{"name": str, "score": float}, ...]}
 
 # ========== ЛОГГЕР ==========
 logging.basicConfig(
@@ -152,7 +152,7 @@ def send_telegram_media_group(video_path, photo_path, caption, chat_id, bot_toke
             media.append({
                 'type': 'photo',
                 'media': 'attach://photo',
-                'caption': caption,  # подпись прикрепляется к фото
+                'caption': caption,
             })
             files['photo'] = open(photo_path, 'rb')
         media.append({
@@ -323,8 +323,8 @@ def split_video(input_path, prefix):
     return parts
 
 # ========== ОБРАБОТКА ОДИНОЧНОГО ВИДЕО (например, с балкона) ==========
-def process_single_video(video_path, snapshot_path, event_id, description, person_name, camera):
-    """Обработка одиночного видео (например, с балкона). Нормализация, отправка только в первый чат."""
+def process_single_video(video_path, snapshot_path, event_id, description, faces_list, camera):
+    """Обработка одиночного видео. Нормализация, отправка только в первый чат."""
     logger.info(f"Processing single video from {camera}: {video_path.name}")
 
     temp_dir = TEMP_DIR / f"single_{int(time.time())}_{camera}"
@@ -339,21 +339,29 @@ def process_single_video(video_path, snapshot_path, event_id, description, perso
             logger.error(f"Normalization failed for {video_path.name}: {e}")
             return
 
-        # Проверяем размер нормализованного видео
         size_mb = os.path.getsize(norm_path) / (1024 * 1024)
 
-        # Формируем подпись
-        if INCLUDE_FACE_NAME and person_name:
-            if description:
-                caption = f"{person_name}: {description}"
-            else:
-                caption = f"Обнаружен {person_name}"
+        # Формируем строку с именами
+        if faces_list:
+            # Сортируем по убыванию уверенности (опционально)
+            sorted_faces = sorted(faces_list, key=lambda f: f["score"], reverse=True)
+            names_str = ", ".join([f["name"] for f in sorted_faces])
         else:
-            caption = description if description else "Обнаружено движение"
+            names_str = None
 
-        # Отправка только в первый чат (без второго)
+        # Формируем подпись для основного чата
+        if INCLUDE_FACE_NAME and names_str:
+            if INCLUDE_DESCRIPTION_IN_MAIN and description:
+                caption = f"{names_str}: {description}"
+            else:
+                caption = f"Обнаружены: {names_str}"
+        else:
+            if INCLUDE_DESCRIPTION_IN_MAIN and description:
+                caption = description
+            else:
+                caption = "Обнаружено движение"
+
         if size_mb <= MAX_SAFE_SIZE_MB:
-            # Просто отправляем видео (со снэпшотом, если есть)
             if snapshot_path and Path(snapshot_path).exists():
                 ok = send_telegram_media_group(
                     norm_path, snapshot_path, caption,
@@ -370,7 +378,6 @@ def process_single_video(video_path, snapshot_path, event_id, description, perso
             else:
                 logger.error(f"Failed to send single video {norm_path.name}, keeping in temp")
         else:
-            # Разбиваем на части
             parts = split_video(norm_path, f"{norm_path.stem}_part")
             all_sent = True
             for part in parts:
@@ -380,14 +387,13 @@ def process_single_video(video_path, snapshot_path, event_id, description, perso
                     all_sent = False
                     logger.error(f"Failed to send part {part.name}, keeping")
             if all_sent:
-                logger.info(f"All parts of single video sent")
+                logger.info("All parts of single video sent")
                 norm_path.unlink(missing_ok=True)
             else:
-                logger.warning(f"Some parts of single video failed to send")
+                logger.warning("Some parts of single video failed to send")
     finally:
         if temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
-        # Удаляем исходные файлы
         video_path.unlink(missing_ok=True)
         if snapshot_path:
             snapshot_path.unlink(missing_ok=True)
@@ -395,25 +401,34 @@ def process_single_video(video_path, snapshot_path, event_id, description, perso
         event_faces.pop(event_id, None)
 
 # ========== ОБРАБОТКА ПАЧКИ ОБЫЧНЫХ ВИДЕО ==========
-def process_batch(file_paths):  # список кортежей (video_path, snapshot_path, event_id, description, person_name)
+def process_batch(file_paths):  # список кортежей (video_path, snapshot_path, event_id, description, faces_list)
     if not file_paths:
         return
 
     logger.info(f"Processing batch of {len(file_paths)} files")
 
-    # Собираем описания и имена
+    # Собираем все описания (берём первое для подписи)
     descriptions = [desc for _, _, _, desc, _ in file_paths if desc]
-    person_names = [name for _, _, _, _, name in file_paths if name]
 
-    # Формируем финальную подпись для основного чата
-    if INCLUDE_FACE_NAME and person_names:
-        main_person = person_names[0]
-        if descriptions:
-            final_description = f"{main_person}: {descriptions[0]}"
+    # Собираем все уникальные имена из всех событий пачки
+    all_names = set()
+    for _, _, _, _, faces in file_paths:
+        if faces:
+            for face in faces:
+                all_names.add(face["name"])
+    names_str = ", ".join(sorted(all_names)) if all_names else None
+
+    # Формируем подпись для основного чата
+    if INCLUDE_FACE_NAME and names_str:
+        if INCLUDE_DESCRIPTION_IN_MAIN and descriptions:
+            final_description = f"{names_str}: {descriptions[0]}"
         else:
-            final_description = f"Обнаружен {main_person}"
+            final_description = f"Обнаружены: {names_str}"
     else:
-        final_description = descriptions[0] if descriptions else "Обнаружено движение"
+        if INCLUDE_DESCRIPTION_IN_MAIN and descriptions:
+            final_description = descriptions[0]
+        else:
+            final_description = "Обнаружено движение"
 
     # Берём snapshot первого события, если есть
     first_snapshot = file_paths[0][1] if file_paths[0][1] and Path(file_paths[0][1]).exists() else None
@@ -423,7 +438,7 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
 
     try:
         normalized = []
-        for i, (video_path, snap_path, eid, desc, person) in enumerate(file_paths):
+        for i, (video_path, snap_path, eid, desc, faces) in enumerate(file_paths):
             norm = temp_dir / f"norm_{i:03d}.mp4"
             try:
                 normalize_video(video_path, norm)
@@ -457,14 +472,11 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
 
         merged_size_mb = os.path.getsize(merged) / (1024 * 1024)
 
-        # --- Основная отправка (с подписью) ---
         if merged_size_mb <= MAX_SAFE_SIZE_MB:
-            # Одно видео – перемещаем в send
             final_video = SEND_DIR / f"{merged.stem}.mp4"
             shutil.move(str(merged), str(final_video))
             os.chmod(final_video, 0o664)
 
-            # Если есть snapshot, копируем его в send
             final_snapshot = None
             if first_snapshot:
                 final_snapshot = SEND_DIR / f"{merged.stem}.jpg"
@@ -488,7 +500,7 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
                 if SECOND_TELEGRAM_CHAT_ID:
                     if final_snapshot:
                         send_telegram_media_group(
-                            final_video, final_snapshot, "",  # пустая подпись
+                            final_video, final_snapshot, "",
                             SECOND_TELEGRAM_CHAT_ID,
                             SECOND_TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN
                         )
@@ -498,7 +510,6 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
                             SECOND_TELEGRAM_CHAT_ID,
                             SECOND_TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN
                         )
-                # Удаление файлов
                 final_video.unlink(missing_ok=True)
                 if final_snapshot:
                     final_snapshot.unlink(missing_ok=True)
@@ -506,15 +517,12 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
             else:
                 logger.error(f"Failed to send {final_video.name}, keeping files")
         else:
-            # Разбиваем на части
             parts = split_video(merged, merged.stem)
             merged.unlink(missing_ok=True)
 
             all_sent = True
             for part in parts:
-                # Отправка в основной чат
                 if send_telegram_video(part, final_description, TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN):
-                    # Отправка во второй чат (без подписи)
                     if SECOND_TELEGRAM_CHAT_ID:
                         send_telegram_video(
                             part, "",
@@ -531,7 +539,7 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
             else:
                 logger.warning(f"Some parts failed to send, kept in {SEND_DIR}")
 
-        # Удаляем исходные файлы (видео и snapshot)
+        # Удаляем исходные файлы
         for video_path, snap_path, eid, _, _ in file_paths:
             video_path.unlink(missing_ok=True)
             if snap_path:
@@ -560,16 +568,13 @@ def worker_loop():
             if raw_desc:
                 raw_desc = translate_to_russian(raw_desc)
 
-            face_info = event_faces.get(eid, {})
-            person_name = face_info.get("name", "")
+            faces_list = event_faces.get(eid, [])   # список лиц
 
-            # Если это балкон, обрабатываем сразу и начинаем новую итерацию
             if cam == "balcony":
-                process_single_video(video_path, snap_path, eid, raw_desc, person_name, cam)
-                continue   # переходим к следующему событию
+                process_single_video(video_path, snap_path, eid, raw_desc, faces_list, cam)
+                continue
 
-            # Иначе добавляем в обычную пачку
-            session_files.append((video_path, snap_path, eid, raw_desc, person_name))
+            session_files.append((video_path, snap_path, eid, raw_desc, faces_list))
 
         # Ожидание новых событий (для обычных видео)
         while True:
@@ -586,30 +591,28 @@ def worker_loop():
                     if raw_ndesc:
                         raw_ndesc = translate_to_russian(raw_ndesc)
 
-                    nface = event_faces.get(neid, {})
-                    nperson = nface.get("name", "")
+                    nfaces = event_faces.get(neid, [])
 
-                    # Если это балкон, обрабатываем сразу и не добавляем в пачку
                     if ncam == "balcony":
-                        process_single_video(nvideo, nsnap, neid, raw_ndesc, nperson, ncam)
-                        continue   # продолжаем ожидание других событий
+                        process_single_video(nvideo, nsnap, neid, raw_ndesc, nfaces, ncam)
+                        continue
 
-                    session_files.append((nvideo, nsnap, neid, raw_ndesc, nperson))
+                    session_files.append((nvideo, nsnap, neid, raw_ndesc, nfaces))
             except queue.Empty:
                 break
 
-        # Обновляем описания и имена, если пришли после таймаута
-        for i, (vpath, spath, eid, desc, person) in enumerate(session_files):
+        # Обновляем описания и лица, если пришли после таймаута
+        for i, (vpath, spath, eid, desc, faces) in enumerate(session_files):
             updated = False
             if not desc and eid in event_descriptions:
                 desc = translate_to_russian(event_descriptions[eid])
                 updated = True
-            if not person and eid in event_faces:
-                person = event_faces[eid]["name"]
+            if not faces and eid in event_faces:
+                faces = event_faces[eid]
                 updated = True
             if updated:
-                session_files[i] = (vpath, spath, eid, desc, person)
-                logger.info(f"Updated data for event {eid}: desc='{desc[:30]}', person='{person}'")
+                session_files[i] = (vpath, spath, eid, desc, faces)
+                logger.info(f"Updated data for event {eid}: desc='{desc[:30]}', faces={len(faces)}")
 
         if session_files:
             process_batch(session_files)
@@ -642,13 +645,15 @@ def on_message(client, userdata, msg):
                     event_descriptions[event_id] = description
                     logger.info(f"Stored description for event {event_id}: {description}")
 
-            # Обработка распознанных лиц
+            # Обработка распознанных лиц (добавляем в список)
             elif data.get("type") == "face":
                 event_id = data.get("id")
                 name = data.get("name")
                 score = data.get("score", 0)
                 if event_id and name and score >= FACE_CONFIDENCE_THRESHOLD:
-                    event_faces[event_id] = {"name": name, "score": score}
+                    if event_id not in event_faces:
+                        event_faces[event_id] = []
+                    event_faces[event_id].append({"name": name, "score": score})
                     logger.info(f"Face recognized for event {event_id}: {name} (confidence: {score:.2f})")
 
     except Exception as e:
@@ -660,9 +665,8 @@ def main():
     initial = list(NEW_DIR.glob("*.mp4"))
     if initial:
         logger.info(f"Startup: {len(initial)} files found → force merge")
-        # Для старых файлов у нас нет информации о камере, поэтому обработаем их как обычные (все вместе)
-        # Но можно попробовать определить камеру из имени файла, если нужно.
-        fake_list = [(p, None, "", "", "") for p in initial]  # без снэпшотов и данных
+        # Для старых файлов нет информации о камере, лицах, описаниях
+        fake_list = [(p, None, "", "", []) for p in initial]  # (video_path, snapshot_path, event_id, description, faces_list)
         threading.Thread(target=lambda: process_batch(fake_list), daemon=True).start()
 
     threading.Thread(target=worker_loop, daemon=True).start()
