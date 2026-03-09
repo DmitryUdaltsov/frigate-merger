@@ -23,24 +23,60 @@ import paho.mqtt.client as mqtt
 # ========== ИМПОРТ КОНФИГУРАЦИИ ==========
 from config import *
 
+# ========== ДОПОЛНИТЕЛЬНЫЕ КОНСТАНТЫ (можно перенести в config) ==========
+VIDEO_WIDTH = 1280
+VIDEO_HEIGHT = 720
+NVENC_BITRATE = "2M"
+NVENC_MAXRATE = "2.5M"
+NVENC_BUFSIZE = "5M"
+NVENC_PRESET = "p5"        # можно "p4" для экономии памяти
+SW_CRF = 23
+SW_PRESET = "medium"
+
+TRANSLATION_CACHE_FILE = os.path.join(BASE_DIR, "translation_cache.json")
+FAILED_DIR = Path(BASE_DIR) / "failed"
+CLEANUP_DAYS_NEW = 7        # для NEW_DIR
+CLEANUP_DAYS_SEND = 7       # для SEND_DIR
+CLEANUP_DAYS_TEMP = 1       # для TEMP_DIR
+
 # ========== ПУТИ ==========
 base_path = Path(BASE_DIR)
 NEW_DIR = base_path / "new_event"
 SEND_DIR = base_path / "send"
 TEMP_DIR = base_path / "temp_merge"
+FAILED_DIR.mkdir(parents=True, exist_ok=True)
 
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
 NEW_DIR.mkdir(parents=True, exist_ok=True)
 SEND_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
+SEMAPHORE_COUNT = 1
+
 event_queue = queue.Queue()
 merge_lock = threading.Lock()
 event_descriptions = {}
 event_faces = {}  # {event_id: [{"name": str, "score": float}, ...]}
 
-# Семафор для ограничения параллельных NVENC сессий (2 одновременно)
-nvenc_semaphore = threading.Semaphore(2)
+# Семафор для ограничения параллельных NVENC сессий
+nvenc_semaphore = threading.Semaphore(SEMAPHORE_COUNT)
+
+# ========== КЭШ ПЕРЕВОДОВ ==========
+translation_cache = {}
+if os.path.exists(TRANSLATION_CACHE_FILE):
+    try:
+        with open(TRANSLATION_CACHE_FILE, "r", encoding="utf-8") as f:
+            translation_cache = json.load(f)
+        logger.info(f"Loaded {len(translation_cache)} translations from cache")
+    except Exception as e:
+        logger.warning(f"Could not load translation cache: {e}")
+
+def save_translation_cache():
+    try:
+        with open(TRANSLATION_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(translation_cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save translation cache: {e}")
 
 # ========== ЛОГГЕР ==========
 logging.basicConfig(
@@ -95,7 +131,7 @@ def run_ffmpeg(cmd, timeout=300):
         raise
 
 def translate_to_russian(text):
-    """Переводит английский текст на русский через Ollama (если включено)."""
+    """Переводит английский текст на русский через Ollama (если включено), с кэшированием."""
     if not TRANSLATE_TO_RUSSIAN or not text:
         return text
 
@@ -104,6 +140,11 @@ def translate_to_russian(text):
 
     if len(text) < 3:
         return text
+
+    # Проверка кэша
+    if text in translation_cache:
+        logger.info(f"Using cached translation for: {text[:30]}...")
+        return translation_cache[text]
 
     prompts = [
         f"""Translate the following text from English to Russian. Provide only the translation, no additional text.
@@ -136,6 +177,9 @@ Russian translation:""",
             result = result.replace('"', '').strip()
             if result:
                 logger.info(f"Translated: '{text[:30]}...' -> '{result[:30]}...'")
+                # Сохраняем в кэш
+                translation_cache[text] = result
+                save_translation_cache()
                 return result
         except Exception as e:
             logger.warning(f"Translation attempt {i} failed: {e}")
@@ -216,22 +260,42 @@ def send_telegram_video(video_path, caption, chat_id, bot_token):
     logger.error(f"Failed to send {video_path.name} to {chat_id} after {TELEGRAM_RETRY_ATTEMPTS} attempts")
     return False
 
-# ========== НОРМАЛИЗАЦИЯ С FALLBACK ==========
+# ========== ОЧИСТКА СТАРЫХ ФАЙЛОВ ==========
+def cleanup_old_files(directory, days):
+    """Удаляет файлы старше указанного количества дней."""
+    now = time.time()
+    cutoff = now - days * 86400
+    removed = 0
+    for f in Path(directory).glob("*.*"):
+        if f.is_file():
+            try:
+                mtime = f.stat().st_mtime
+                if mtime < cutoff:
+                    f.unlink()
+                    removed += 1
+            except Exception as e:
+                logger.warning(f"Could not clean {f}: {e}")
+    if removed:
+        logger.info(f"Cleaned {removed} old files from {directory}")
+
+# ========== НОРМАЛИЗАЦИЯ С FALLBACK (УЛУЧШЕННАЯ) ==========
 def normalize_video(input_path, output_path):
     audio_args = [] if has_audio_stream(input_path) else ["-an"]
 
-    # Команда NVENC
+    # NVENC команда с улучшениями
     cmd_nvenc = [
-        "ffmpeg", "-hwaccel", "cuda", "-fflags", "+genpts",
+        "ffmpeg", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+        "-fflags", "+genpts",
         "-i", str(input_path),
-        "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,"
-               "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,fps=15",
-        "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
+        "-vf", f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=decrease,"
+               f"pad={VIDEO_WIDTH}:{VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black",
+        "-r", "15",  # вместо fps в фильтре
+        "-c:v", "h264_nvenc", "-preset", NVENC_PRESET, "-tune", "hq",
         "-profile:v", "high", "-level", "4.1",
-        "-force_key_frames", "expr:gte(t,n_forced*2)",
-        "-b:v", "2M", "-maxrate", "2.5M", "-bufsize", "5M",
+        "-b:v", NVENC_BITRATE, "-maxrate", NVENC_MAXRATE, "-bufsize", NVENC_BUFSIZE,
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart",
+        "-force_key_frames", "expr:gte(t,n_forced*2)",
+        "-movflags", "+faststart",
         "-y", str(output_path)
     ] + audio_args
 
@@ -239,11 +303,12 @@ def normalize_video(input_path, output_path):
     cmd_sw = [
         "ffmpeg",
         "-i", str(input_path),
-        "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,"
-               "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,fps=15",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+        "-vf", f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=decrease,"
+               f"pad={VIDEO_WIDTH}:{VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black",
+        "-r", "15",
+        "-c:v", "libx264", "-preset", SW_PRESET, "-crf", str(SW_CRF),
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart",
+        "-movflags", "+faststart",
         "-y", str(output_path)
     ] + audio_args
 
@@ -253,7 +318,12 @@ def normalize_video(input_path, output_path):
     except Exception as e:
         logger.warning(f"NVENC failed for {input_path.name}, falling back to software encoding. Error: {e}")
         run_ffmpeg(cmd_sw)
+
+    if not output_path.exists():
+        raise RuntimeError(f"Normalization failed: output file {output_path} not created")
+
     os.chmod(output_path, 0o664)
+    logger.info(f"Normalized: {output_path.name} ({os.path.getsize(output_path)/1024/1024:.2f} MB)")
 
 # ========== СКАЧИВАНИЕ ==========
 def download_clip(event_id, camera, start_time):
@@ -315,7 +385,7 @@ def download_clip(event_id, camera, start_time):
     logger.info(f"Downloaded: {video_path.name}" + (f" + snapshot" if snapshot_ok else ""))
     return (video_path, snapshot_path if snapshot_ok else None)
 
-# ========== РАЗБИЕНИЕ С FALLBACK ==========
+# ========== РАЗБИЕНИЕ С FALLBACK (УЛУЧШЕННОЕ) ==========
 def split_video(input_path, prefix):
     size_mb = os.path.getsize(input_path) / (1024 * 1024)
     if size_mb <= MAX_SAFE_SIZE_MB:
@@ -339,23 +409,30 @@ def split_video(input_path, prefix):
         out = SEND_DIR / f"{prefix}_p{index:03d}.mp4"
         logger.info(f"Creating segment {out.name} from {current:.2f}s to {current+segment_duration:.2f}s")
 
-        # NVENC команда
+        # NVENC команда с улучшениями
         cmd_nvenc = [
-            "ffmpeg", "-hwaccel", "cuda", "-fflags", "+genpts",
+            "ffmpeg", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+            "-fflags", "+genpts",
             "-i", str(input_path), "-ss", str(current), "-t", str(segment_duration),
-            "-vf", "fps=15",
-            "-c:v", "h264_nvenc", "-preset", "p5",
+            "-vf", f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=decrease,"
+                   f"pad={VIDEO_WIDTH}:{VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black",
+            "-r", "15",
+            "-c:v", "h264_nvenc", "-preset", NVENC_PRESET,
+            "-b:v", NVENC_BITRATE, "-maxrate", NVENC_MAXRATE, "-bufsize", NVENC_BUFSIZE,
+            "-pix_fmt", "yuv420p",
             "-force_key_frames", "expr:gte(t,n_forced*2)",
-            "-b:v", "2M", "-maxrate", "2.5M", "-bufsize", "5M",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-movflags", "+faststart",
         ]
         # Программная команда
         cmd_sw = [
             "ffmpeg",
             "-i", str(input_path), "-ss", str(current), "-t", str(segment_duration),
-            "-vf", "fps=15",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-vf", f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=decrease,"
+                   f"pad={VIDEO_WIDTH}:{VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black",
+            "-r", "15",
+            "-c:v", "libx264", "-preset", "fast", "-crf", str(SW_CRF),
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
         ]
         if has_audio:
             cmd_nvenc.extend(["-c:a", "aac", "-b:a", "64k"])
@@ -445,7 +522,9 @@ def process_single_video(video_path, snapshot_path, event_id, description, faces
                 logger.info(f"Single video sent: {norm_path.name}")
                 norm_path.unlink(missing_ok=True)
             else:
-                logger.error(f"Failed to send single video {norm_path.name}, keeping in temp")
+                logger.error(f"Failed to send single video {norm_path.name}, moving to failed")
+                failed_path = FAILED_DIR / norm_path.name
+                shutil.move(str(norm_path), str(failed_path))
         else:
             parts = split_video(norm_path, f"{norm_path.stem}_part")
             all_sent = True
@@ -454,12 +533,14 @@ def process_single_video(video_path, snapshot_path, event_id, description, faces
                     part.unlink(missing_ok=True)
                 else:
                     all_sent = False
-                    logger.error(f"Failed to send part {part.name}, keeping")
+                    logger.error(f"Failed to send part {part.name}, moving to failed")
+                    failed_path = FAILED_DIR / part.name
+                    shutil.move(str(part), str(failed_path))
             if all_sent:
                 logger.info("All parts of single video sent")
                 norm_path.unlink(missing_ok=True)
             else:
-                logger.warning("Some parts of single video failed to send")
+                logger.warning("Some parts of single video failed to send, normalized file kept")
     finally:
         if temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -469,7 +550,7 @@ def process_single_video(video_path, snapshot_path, event_id, description, faces
         event_descriptions.pop(event_id, None)
         event_faces.pop(event_id, None)
 
-# ========== ОБРАБОТКА ПАЧКИ ОБЫЧНЫХ ВИДЕО ==========
+# ========== ОБРАБОТКА ПАЧКИ ОБЫЧНЫХ ВИДЕО (УЛУЧШЕННАЯ) ==========
 def process_batch(file_paths):  # список кортежей (video_path, snapshot_path, event_id, description, faces_list)
     if not file_paths:
         return
@@ -521,16 +602,18 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
 
         merged = NEW_DIR / f"merged_{int(time.time())}.mp4"
 
-        # Конкатенация с fallback
+        # Конкатенация с fallback (улучшенная)
         concat_cmd_nvenc = [
-            "ffmpeg", "-f", "concat", "-safe", "0", "-i", str(list_file),
-            "-c:v", "h264_nvenc", "-preset", "p5",
-            "-b:v", "2M", "-maxrate", "2.5M", "-bufsize", "5M",
+            "ffmpeg", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+            "-f", "concat", "-safe", "0", "-i", str(list_file),
+            "-c:v", "h264_nvenc", "-preset", NVENC_PRESET,
+            "-b:v", NVENC_BITRATE, "-maxrate", NVENC_MAXRATE, "-bufsize", NVENC_BUFSIZE,
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         ]
         concat_cmd_sw = [
-            "ffmpeg", "-f", "concat", "-safe", "0", "-i", str(list_file),
-            "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+            "ffmpeg",
+            "-f", "concat", "-safe", "0", "-i", str(list_file),
+            "-c:v", "libx264", "-preset", SW_PRESET, "-crf", str(SW_CRF),
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         ]
         if has_audio_stream(normalized[0]):
@@ -548,6 +631,9 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
         except Exception as e:
             logger.warning(f"NVENC concat failed, falling back to software encoding. Error: {e}")
             run_ffmpeg(concat_cmd_sw)
+
+        if not merged.exists():
+            raise RuntimeError("Merged file not created")
 
         merged_size_mb = os.path.getsize(merged) / (1024 * 1024)
 
@@ -592,7 +678,12 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
                     final_snapshot.unlink(missing_ok=True)
                 logger.info(f"Sent and deleted: {final_video.name}")
             else:
-                logger.error(f"Failed to send {final_video.name}, keeping files")
+                logger.error(f"Failed to send {final_video.name}, moving to failed")
+                failed_path = FAILED_DIR / final_video.name
+                shutil.move(str(final_video), str(failed_path))
+                if final_snapshot:
+                    failed_snap = FAILED_DIR / final_snapshot.name
+                    shutil.move(str(final_snapshot), str(failed_snap))
         else:
             parts = split_video(merged, merged.stem)
             merged.unlink(missing_ok=True)
@@ -609,12 +700,14 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
                     part.unlink(missing_ok=True)
                 else:
                     all_sent = False
-                    logger.error(f"Failed to send {part.name}, keeping file")
+                    logger.error(f"Failed to send {part.name}, moving to failed")
+                    failed_path = FAILED_DIR / part.name
+                    shutil.move(str(part), str(failed_path))
 
             if all_sent:
                 logger.info(f"All {len(parts)} parts sent and deleted")
             else:
-                logger.warning(f"Some parts failed to send, kept in {SEND_DIR}")
+                logger.warning(f"Some parts failed to send, kept in {FAILED_DIR}")
 
         for video_path, snap_path, eid, _, _ in file_paths:
             video_path.unlink(missing_ok=True)
@@ -732,6 +825,11 @@ def on_message(client, userdata, msg):
 
 # ========== MAIN ==========
 def main():
+    # Очистка старых файлов при старте
+    cleanup_old_files(NEW_DIR, CLEANUP_DAYS_NEW)
+    cleanup_old_files(SEND_DIR, CLEANUP_DAYS_SEND)
+    cleanup_old_files(TEMP_DIR, CLEANUP_DAYS_TEMP)
+
     initial = list(NEW_DIR.glob("*.mp4"))
     if initial:
         logger.info(f"Startup: {len(initial)} files found → force merge")
