@@ -227,7 +227,7 @@ def normalize_video(input_path, output_path):
         "-force_key_frames", "expr:gte(t,n_forced*2)",
         "-b:v", "2M", "-maxrate", "2.5M", "-bufsize", "5M",
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart",
+        "-c:a", "aac", "-b:a", "48k", "-movflags", "+faststart",
         "-y", str(output_path)
     ] + audio_args
     run_ffmpeg(cmd)
@@ -312,19 +312,27 @@ def split_video(input_path, prefix):
 
     while current < duration:
         out = SEND_DIR / f"{prefix}_p{index:03d}.mp4"
+
+        # Формируем команду: сначала все параметры, потом выходной файл
         cmd = [
             "ffmpeg", "-hwaccel", "cuda", "-fflags", "+genpts",
             "-i", str(input_path), "-ss", str(current), "-t", str(segment_duration),
-            "-vf", "fps=15", "-c:v", "h264_nvenc", "-preset", "p5",
+            "-vf", "fps=15",
+            "-c:v", "h264_nvenc", "-preset", "p5",
             "-force_key_frames", "expr:gte(t,n_forced*2)",
             "-b:v", "2M", "-maxrate", "2.5M", "-bufsize", "5M",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            "-y", str(out)
         ]
+
+        # Аудио параметры ДО выходного файла
         if has_audio:
-            cmd.extend(["-c:a", "aac", "-b:a", "96k"])
+            cmd.extend(["-c:a", "aac", "-b:a", "64k"])  # уменьшил битрейт аудио
         else:
             cmd.append("-an")
+
+        # Выходной файл в конце
+        cmd.extend(["-y", str(out)])
+
         run_ffmpeg(cmd)
         part_size = os.path.getsize(out) / (1024 * 1024)
         logger.info(f"Segment created: {out.name}, size: {part_size:.2f}MB")
