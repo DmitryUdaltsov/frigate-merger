@@ -71,10 +71,22 @@ def get_duration(path):
 
 def run_ffmpeg(cmd, timeout=300):
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            encoding='utf-8',
+            errors='ignore',  # игнорируем неверные байты
+            timeout=timeout
+        )
         return result
     except subprocess.CalledProcessError as e:
-        logger.error(f"FFmpeg error:\n{' '.join(cmd)}\n{e.stderr}")
+        # e.stderr уже декодирован с errors='ignore', но на всякий случай обработаем
+        stderr = e.stderr if e.stderr else ''
+        logger.error(f"FFmpeg error:\n{' '.join(cmd)}\n{stderr}")
+        raise
+    except subprocess.TimeoutExpired:
+        logger.error(f"FFmpeg timeout:\n{' '.join(cmd)}")
         raise
     except Exception as e:
         logger.error(f"FFmpeg failed: {e}")
