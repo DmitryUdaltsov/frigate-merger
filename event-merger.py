@@ -39,6 +39,9 @@ merge_lock = threading.Lock()
 event_descriptions = {}
 event_faces = {}  # {event_id: [{"name": str, "score": float}, ...]}
 
+# Семафор для ограничения параллельных NVENC сессий (2 одновременно)
+nvenc_semaphore = threading.Semaphore(2)
+
 # ========== ЛОГГЕР ==========
 logging.basicConfig(
     level=logging.INFO,
@@ -76,12 +79,11 @@ def run_ffmpeg(cmd, timeout=300):
             check=True,
             capture_output=True,
             encoding='utf-8',
-            errors='ignore',  # игнорируем неверные байты
+            errors='ignore',
             timeout=timeout
         )
         return result
     except subprocess.CalledProcessError as e:
-        # e.stderr уже декодирован с errors='ignore', но на всякий случай обработаем
         stderr = e.stderr if e.stderr else ''
         logger.error(f"FFmpeg error:\n{' '.join(cmd)}\n{stderr}")
         raise
@@ -227,10 +229,11 @@ def normalize_video(input_path, output_path):
         "-force_key_frames", "expr:gte(t,n_forced*2)",
         "-b:v", "2M", "-maxrate", "2.5M", "-bufsize", "5M",
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "48k", "-movflags", "+faststart",
+        "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart",
         "-y", str(output_path)
     ] + audio_args
-    run_ffmpeg(cmd)
+    with nvenc_semaphore:
+        run_ffmpeg(cmd)
     os.chmod(output_path, 0o664)
 
 # ========== СКАЧИВАНИЕ ==========
@@ -245,7 +248,6 @@ def download_clip(event_id, camera, start_time):
     video_ok = False
     snapshot_ok = False
 
-    # Скачиваем видео
     for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
         try:
             with requests.get(video_url, stream=True, timeout=(10, 120)) as r:
@@ -269,7 +271,6 @@ def download_clip(event_id, camera, start_time):
         logger.error(f"Failed to download video for {event_id}")
         return (None, None)
 
-    # Скачиваем snapshot (до 2 попыток)
     for attempt in range(1, 3):
         try:
             r = requests.get(snapshot_url, timeout=(10, 30))
@@ -313,7 +314,6 @@ def split_video(input_path, prefix):
     while current < duration:
         out = SEND_DIR / f"{prefix}_p{index:03d}.mp4"
 
-        # Формируем команду: сначала все параметры, потом выходной файл
         cmd = [
             "ffmpeg", "-hwaccel", "cuda", "-fflags", "+genpts",
             "-i", str(input_path), "-ss", str(current), "-t", str(segment_duration),
@@ -323,17 +323,15 @@ def split_video(input_path, prefix):
             "-b:v", "2M", "-maxrate", "2.5M", "-bufsize", "5M",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         ]
-
-        # Аудио параметры ДО выходного файла
         if has_audio:
-            cmd.extend(["-c:a", "aac", "-b:a", "64k"])  # уменьшил битрейт аудио
+            cmd.extend(["-c:a", "aac", "-b:a", "64k"])
         else:
             cmd.append("-an")
-
-        # Выходной файл в конце
         cmd.extend(["-y", str(out)])
 
-        run_ffmpeg(cmd)
+        with nvenc_semaphore:
+            run_ffmpeg(cmd)
+
         part_size = os.path.getsize(out) / (1024 * 1024)
         logger.info(f"Segment created: {out.name}, size: {part_size:.2f}MB")
         parts.append(out)
@@ -344,14 +342,12 @@ def split_video(input_path, prefix):
 
 # ========== ОБРАБОТКА ОДИНОЧНОГО ВИДЕО (например, с балкона) ==========
 def process_single_video(video_path, snapshot_path, event_id, description, faces_list, camera):
-    """Обработка одиночного видео. Нормализация, отправка только в первый чат."""
     logger.info(f"Processing single video from {camera}: {video_path.name}")
 
     temp_dir = TEMP_DIR / f"single_{int(time.time())}_{camera}"
     temp_dir.mkdir(exist_ok=True)
 
     try:
-        # Нормализуем видео
         norm_path = temp_dir / f"norm_{video_path.stem}.mp4"
         try:
             normalize_video(video_path, norm_path)
@@ -361,15 +357,12 @@ def process_single_video(video_path, snapshot_path, event_id, description, faces
 
         size_mb = os.path.getsize(norm_path) / (1024 * 1024)
 
-        # Формируем строку с именами
         if faces_list:
-            # Сортируем по убыванию уверенности (опционально)
             sorted_faces = sorted(faces_list, key=lambda f: f["score"], reverse=True)
             names_str = ", ".join([f["name"] for f in sorted_faces])
         else:
             names_str = None
 
-        # Формируем подпись для основного чата
         if INCLUDE_FACE_NAME and names_str:
             if INCLUDE_DESCRIPTION_IN_MAIN and description:
                 caption = f"{names_str}: {description}"
@@ -427,10 +420,8 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
 
     logger.info(f"Processing batch of {len(file_paths)} files")
 
-    # Собираем все описания (берём первое для подписи)
     descriptions = [desc for _, _, _, desc, _ in file_paths if desc]
 
-    # Собираем все уникальные имена из всех событий пачки
     all_names = set()
     for _, _, _, _, faces in file_paths:
         if faces:
@@ -438,7 +429,6 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
                 all_names.add(face["name"])
     names_str = ", ".join(sorted(all_names)) if all_names else None
 
-    # Формируем подпись для основного чата
     if INCLUDE_FACE_NAME and names_str:
         if INCLUDE_DESCRIPTION_IN_MAIN and descriptions:
             final_description = f"{names_str}: {descriptions[0]}"
@@ -450,7 +440,6 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
         else:
             final_description = "Обнаружено движение"
 
-    # Берём snapshot первого события, если есть
     first_snapshot = file_paths[0][1] if file_paths[0][1] and Path(file_paths[0][1]).exists() else None
 
     temp_dir = TEMP_DIR / f"batch_{int(time.time())}"
@@ -483,12 +472,13 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         ]
         if has_audio_stream(normalized[0]):
-            concat_cmd.extend(["-c:a", "aac", "-b:a", "96k"])
+            concat_cmd.extend(["-c:a", "aac", "-b:a", "64k"])
         else:
             concat_cmd.append("-an")
         concat_cmd.extend(["-y", str(merged)])
 
-        run_ffmpeg(concat_cmd)
+        with nvenc_semaphore:
+            run_ffmpeg(concat_cmd)
 
         merged_size_mb = os.path.getsize(merged) / (1024 * 1024)
 
@@ -503,7 +493,6 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
                 shutil.copy2(str(first_snapshot), str(final_snapshot))
                 os.chmod(final_snapshot, 0o664)
 
-            # Отправка в основной чат
             if final_snapshot:
                 ok = send_telegram_media_group(
                     final_video, final_snapshot, final_description,
@@ -516,7 +505,6 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
                 )
 
             if ok:
-                # Отправка во второй чат (без подписи)
                 if SECOND_TELEGRAM_CHAT_ID:
                     if final_snapshot:
                         send_telegram_media_group(
@@ -559,7 +547,6 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
             else:
                 logger.warning(f"Some parts failed to send, kept in {SEND_DIR}")
 
-        # Удаляем исходные файлы
         for video_path, snap_path, eid, _, _ in file_paths:
             video_path.unlink(missing_ok=True)
             if snap_path:
@@ -577,7 +564,6 @@ def worker_loop():
     while True:
         session_files = []
 
-        # Первое событие
         data = event_queue.get()
         if not data.get("after", {}).get("id"):
             continue
@@ -588,7 +574,7 @@ def worker_loop():
             if raw_desc:
                 raw_desc = translate_to_russian(raw_desc)
 
-            faces_list = event_faces.get(eid, [])   # список лиц
+            faces_list = event_faces.get(eid, [])
 
             if cam == "balcony":
                 process_single_video(video_path, snap_path, eid, raw_desc, faces_list, cam)
@@ -596,7 +582,6 @@ def worker_loop():
 
             session_files.append((video_path, snap_path, eid, raw_desc, faces_list))
 
-        # Ожидание новых событий (для обычных видео)
         while True:
             if len(session_files) >= MAX_FILES:
                 logger.info(f"File count limit reached ({MAX_FILES}), forcing merge")
@@ -621,7 +606,6 @@ def worker_loop():
             except queue.Empty:
                 break
 
-        # Обновляем описания и лица, если пришли после таймаута
         for i, (vpath, spath, eid, desc, faces) in enumerate(session_files):
             updated = False
             if not desc and eid in event_descriptions:
@@ -657,7 +641,6 @@ def on_message(client, userdata, msg):
         elif msg.topic == MQTT_TOPIC_DESCR:
             data = json.loads(msg.payload.decode())
 
-            # Обработка описаний от GenAI
             if data.get("type") == "description":
                 event_id = data.get("id")
                 description = data.get("description")
@@ -665,7 +648,6 @@ def on_message(client, userdata, msg):
                     event_descriptions[event_id] = description
                     logger.info(f"Stored description for event {event_id}: {description}")
 
-            # Обработка распознанных лиц (добавляем в список)
             elif data.get("type") == "face":
                 event_id = data.get("id")
                 name = data.get("name")
@@ -681,12 +663,10 @@ def on_message(client, userdata, msg):
 
 # ========== MAIN ==========
 def main():
-    # Обработка старых файлов при старте
     initial = list(NEW_DIR.glob("*.mp4"))
     if initial:
         logger.info(f"Startup: {len(initial)} files found → force merge")
-        # Для старых файлов нет информации о камере, лицах, описаниях
-        fake_list = [(p, None, "", "", []) for p in initial]  # (video_path, snapshot_path, event_id, description, faces_list)
+        fake_list = [(p, None, "", "", []) for p in initial]
         threading.Thread(target=lambda: process_batch(fake_list), daemon=True).start()
 
     threading.Thread(target=worker_loop, daemon=True).start()
