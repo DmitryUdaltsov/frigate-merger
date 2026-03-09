@@ -51,15 +51,13 @@ NEW_DIR.mkdir(parents=True, exist_ok=True)
 SEND_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-SEMAPHORE_COUNT = 1
-
 event_queue = queue.Queue()
 merge_lock = threading.Lock()
 event_descriptions = {}
 event_faces = {}  # {event_id: [{"name": str, "score": float}, ...]}
 
-# Семафор для ограничения параллельных NVENC сессий
-nvenc_semaphore = threading.Semaphore(SEMAPHORE_COUNT)
+# Семафор для ограничения параллельных NVENC сессий (2 одновременно)
+nvenc_semaphore = threading.Semaphore(2)
 
 # ========== КЭШ ПЕРЕВОДОВ ==========
 translation_cache = {}
@@ -282,12 +280,13 @@ def cleanup_old_files(directory, days):
 def normalize_video(input_path, output_path):
     audio_args = [] if has_audio_stream(input_path) else ["-an"]
 
-    # NVENC команда с улучшениями
+    # NVENC команда с исправлением формата пикселей
     cmd_nvenc = [
         "ffmpeg", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
         "-fflags", "+genpts",
         "-i", str(input_path),
-        "-vf", f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=decrease,"
+        "-vf", "hwdownload,format=yuv420p,"
+               f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=decrease,"
                f"pad={VIDEO_WIDTH}:{VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black",
         "-r", "15",  # вместо fps в фильтре
         "-c:v", "h264_nvenc", "-preset", NVENC_PRESET, "-tune", "hq",
@@ -409,12 +408,13 @@ def split_video(input_path, prefix):
         out = SEND_DIR / f"{prefix}_p{index:03d}.mp4"
         logger.info(f"Creating segment {out.name} from {current:.2f}s to {current+segment_duration:.2f}s")
 
-        # NVENC команда с улучшениями
+        # NVENC команда с исправлением формата
         cmd_nvenc = [
             "ffmpeg", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
             "-fflags", "+genpts",
             "-i", str(input_path), "-ss", str(current), "-t", str(segment_duration),
-            "-vf", f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=decrease,"
+            "-vf", "hwdownload,format=yuv420p,"
+                   f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=decrease,"
                    f"pad={VIDEO_WIDTH}:{VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black",
             "-r", "15",
             "-c:v", "h264_nvenc", "-preset", NVENC_PRESET,
@@ -602,14 +602,7 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
 
         merged = NEW_DIR / f"merged_{int(time.time())}.mp4"
 
-        # Конкатенация с fallback (улучшенная)
-        concat_cmd_nvenc = [
-            "ffmpeg", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
-            "-f", "concat", "-safe", "0", "-i", str(list_file),
-            "-c:v", "h264_nvenc", "-preset", NVENC_PRESET,
-            "-b:v", NVENC_BITRATE, "-maxrate", NVENC_MAXRATE, "-bufsize", NVENC_BUFSIZE,
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-        ]
+        # Конкатенация с fallback (здесь аппаратное ускорение не нужно)
         concat_cmd_sw = [
             "ffmpeg",
             "-f", "concat", "-safe", "0", "-i", str(list_file),
@@ -617,20 +610,16 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         ]
         if has_audio_stream(normalized[0]):
-            concat_cmd_nvenc.extend(["-c:a", "aac", "-b:a", "64k"])
             concat_cmd_sw.extend(["-c:a", "aac", "-b:a", "64k"])
         else:
-            concat_cmd_nvenc.append("-an")
             concat_cmd_sw.append("-an")
-        concat_cmd_nvenc.extend(["-y", str(merged)])
         concat_cmd_sw.extend(["-y", str(merged)])
 
         try:
-            with nvenc_semaphore:
-                run_ffmpeg(concat_cmd_nvenc)
+            run_ffmpeg(concat_cmd_sw)  # всегда софт, так как concat не ускоряется
         except Exception as e:
-            logger.warning(f"NVENC concat failed, falling back to software encoding. Error: {e}")
-            run_ffmpeg(concat_cmd_sw)
+            logger.error(f"Concat failed: {e}")
+            return
 
         if not merged.exists():
             raise RuntimeError("Merged file not created")
