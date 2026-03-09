@@ -303,16 +303,22 @@ def split_video(input_path, prefix):
         return [input_path]
 
     duration = get_duration(input_path)
+    if duration <= 0:
+        logger.error(f"split_video: cannot get duration of {input_path}")
+        return [input_path]  # fallback
+
     bitrate = 4_000_000
     segment_duration = max(5, int((MAX_SEGMENT_BYTES * 8) / bitrate))
+    logger.info(f"Splitting {input_path.name}, duration={duration:.2f}s, segment_duration={segment_duration}s")
 
     parts = []
     current = 0
     index = 1
     has_audio = has_audio_stream(input_path)
 
-    while current < duration:
+    while current < duration - 0.1:  # допуск на погрешность
         out = SEND_DIR / f"{prefix}_p{index:03d}.mp4"
+        logger.info(f"Creating segment {out.name} from {current:.2f}s to {current+segment_duration:.2f}s")
 
         cmd = [
             "ffmpeg", "-hwaccel", "cuda", "-fflags", "+genpts",
@@ -329,13 +335,29 @@ def split_video(input_path, prefix):
             cmd.append("-an")
         cmd.extend(["-y", str(out)])
 
-        with nvenc_semaphore:
-            run_ffmpeg(cmd)
+        try:
+            with nvenc_semaphore:
+                run_ffmpeg(cmd)
+        except Exception as e:
+            logger.error(f"FFmpeg failed for segment {out.name}: {e}")
+            out.unlink(missing_ok=True)
+            break
 
-        part_size = os.path.getsize(out) / (1024 * 1024)
-        logger.info(f"Segment created: {out.name}, size: {part_size:.2f}MB")
+        # Проверяем, что сегмент создан успешно
+        if not out.exists():
+            logger.error(f"Segment {out.name} was not created")
+            break
+
+        part_dur = get_duration(out)
+        part_size = os.path.getsize(out)
+        if part_dur <= 0 or part_size < 1024:  # меньше 1 КБ считаем ошибочным
+            logger.error(f"Segment {out.name} has zero duration or too small ({part_size} bytes), aborting split")
+            out.unlink(missing_ok=True)
+            break
+
+        logger.info(f"Segment created: {out.name}, duration: {part_dur:.2f}s, size: {part_size/1024/1024:.2f}MB")
         parts.append(out)
-        current += get_duration(out)
+        current += part_dur
         index += 1
 
     return parts
