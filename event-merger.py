@@ -216,10 +216,12 @@ def send_telegram_video(video_path, caption, chat_id, bot_token):
     logger.error(f"Failed to send {video_path.name} to {chat_id} after {TELEGRAM_RETRY_ATTEMPTS} attempts")
     return False
 
-# ========== НОРМАЛИЗАЦИЯ ==========
+# ========== НОРМАЛИЗАЦИЯ С FALLBACK ==========
 def normalize_video(input_path, output_path):
     audio_args = [] if has_audio_stream(input_path) else ["-an"]
-    cmd = [
+
+    # Команда NVENC
+    cmd_nvenc = [
         "ffmpeg", "-hwaccel", "cuda", "-fflags", "+genpts",
         "-i", str(input_path),
         "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,"
@@ -232,8 +234,25 @@ def normalize_video(input_path, output_path):
         "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart",
         "-y", str(output_path)
     ] + audio_args
-    with nvenc_semaphore:
-        run_ffmpeg(cmd)
+
+    # Запасная программная команда
+    cmd_sw = [
+        "ffmpeg",
+        "-i", str(input_path),
+        "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,"
+               "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,fps=15",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart",
+        "-y", str(output_path)
+    ] + audio_args
+
+    try:
+        with nvenc_semaphore:
+            run_ffmpeg(cmd_nvenc)
+    except Exception as e:
+        logger.warning(f"NVENC failed for {input_path.name}, falling back to software encoding. Error: {e}")
+        run_ffmpeg(cmd_sw)
     os.chmod(output_path, 0o664)
 
 # ========== СКАЧИВАНИЕ ==========
@@ -296,7 +315,7 @@ def download_clip(event_id, camera, start_time):
     logger.info(f"Downloaded: {video_path.name}" + (f" + snapshot" if snapshot_ok else ""))
     return (video_path, snapshot_path if snapshot_ok else None)
 
-# ========== РАЗБИЕНИЕ ==========
+# ========== РАЗБИЕНИЕ С FALLBACK ==========
 def split_video(input_path, prefix):
     size_mb = os.path.getsize(input_path) / (1024 * 1024)
     if size_mb <= MAX_SAFE_SIZE_MB:
@@ -305,7 +324,7 @@ def split_video(input_path, prefix):
     duration = get_duration(input_path)
     if duration <= 0:
         logger.error(f"split_video: cannot get duration of {input_path}")
-        return [input_path]  # fallback
+        return [input_path]
 
     bitrate = 4_000_000
     segment_duration = max(5, int((MAX_SEGMENT_BYTES * 8) / bitrate))
@@ -316,11 +335,12 @@ def split_video(input_path, prefix):
     index = 1
     has_audio = has_audio_stream(input_path)
 
-    while current < duration - 0.1:  # допуск на погрешность
+    while current < duration - 0.1:
         out = SEND_DIR / f"{prefix}_p{index:03d}.mp4"
         logger.info(f"Creating segment {out.name} from {current:.2f}s to {current+segment_duration:.2f}s")
 
-        cmd = [
+        # NVENC команда
+        cmd_nvenc = [
             "ffmpeg", "-hwaccel", "cuda", "-fflags", "+genpts",
             "-i", str(input_path), "-ss", str(current), "-t", str(segment_duration),
             "-vf", "fps=15",
@@ -329,28 +349,42 @@ def split_video(input_path, prefix):
             "-b:v", "2M", "-maxrate", "2.5M", "-bufsize", "5M",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         ]
+        # Программная команда
+        cmd_sw = [
+            "ffmpeg",
+            "-i", str(input_path), "-ss", str(current), "-t", str(segment_duration),
+            "-vf", "fps=15",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        ]
         if has_audio:
-            cmd.extend(["-c:a", "aac", "-b:a", "64k"])
+            cmd_nvenc.extend(["-c:a", "aac", "-b:a", "64k"])
+            cmd_sw.extend(["-c:a", "aac", "-b:a", "64k"])
         else:
-            cmd.append("-an")
-        cmd.extend(["-y", str(out)])
+            cmd_nvenc.append("-an")
+            cmd_sw.append("-an")
+        cmd_nvenc.extend(["-y", str(out)])
+        cmd_sw.extend(["-y", str(out)])
 
         try:
             with nvenc_semaphore:
-                run_ffmpeg(cmd)
+                run_ffmpeg(cmd_nvenc)
         except Exception as e:
-            logger.error(f"FFmpeg failed for segment {out.name}: {e}")
-            out.unlink(missing_ok=True)
-            break
+            logger.warning(f"NVENC failed for segment {out.name}, falling back to software encoding. Error: {e}")
+            try:
+                run_ffmpeg(cmd_sw)
+            except Exception as e2:
+                logger.error(f"Software encoding also failed for {out.name}: {e2}")
+                out.unlink(missing_ok=True)
+                break
 
-        # Проверяем, что сегмент создан успешно
         if not out.exists():
             logger.error(f"Segment {out.name} was not created")
             break
 
         part_dur = get_duration(out)
         part_size = os.path.getsize(out)
-        if part_dur <= 0 or part_size < 1024:  # меньше 1 КБ считаем ошибочным
+        if part_dur <= 0 or part_size < 1024:
             logger.error(f"Segment {out.name} has zero duration or too small ({part_size} bytes), aborting split")
             out.unlink(missing_ok=True)
             break
@@ -487,20 +521,33 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
 
         merged = NEW_DIR / f"merged_{int(time.time())}.mp4"
 
-        concat_cmd = [
+        # Конкатенация с fallback
+        concat_cmd_nvenc = [
             "ffmpeg", "-f", "concat", "-safe", "0", "-i", str(list_file),
             "-c:v", "h264_nvenc", "-preset", "p5",
             "-b:v", "2M", "-maxrate", "2.5M", "-bufsize", "5M",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         ]
+        concat_cmd_sw = [
+            "ffmpeg", "-f", "concat", "-safe", "0", "-i", str(list_file),
+            "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        ]
         if has_audio_stream(normalized[0]):
-            concat_cmd.extend(["-c:a", "aac", "-b:a", "64k"])
+            concat_cmd_nvenc.extend(["-c:a", "aac", "-b:a", "64k"])
+            concat_cmd_sw.extend(["-c:a", "aac", "-b:a", "64k"])
         else:
-            concat_cmd.append("-an")
-        concat_cmd.extend(["-y", str(merged)])
+            concat_cmd_nvenc.append("-an")
+            concat_cmd_sw.append("-an")
+        concat_cmd_nvenc.extend(["-y", str(merged)])
+        concat_cmd_sw.extend(["-y", str(merged)])
 
-        with nvenc_semaphore:
-            run_ffmpeg(concat_cmd)
+        try:
+            with nvenc_semaphore:
+                run_ffmpeg(concat_cmd_nvenc)
+        except Exception as e:
+            logger.warning(f"NVENC concat failed, falling back to software encoding. Error: {e}")
+            run_ffmpeg(concat_cmd_sw)
 
         merged_size_mb = os.path.getsize(merged) / (1024 * 1024)
 
