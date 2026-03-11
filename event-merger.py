@@ -39,8 +39,8 @@ merge_lock = threading.Lock()
 event_descriptions = {}
 event_faces = {}  # {event_id: [{"name": str, "score": float}, ...]}
 
-# Семафор для ограничения параллельных NVENC сессий (2 одновременно)
-nvenc_semaphore = threading.Semaphore(2)
+# Семафор для ограничения параллельных NVENC сессий (1 одновременно)
+nvenc_semaphore = threading.Semaphore(1)
 
 # ========== ЛОГГЕР ==========
 logging.basicConfig(
@@ -220,40 +220,46 @@ def send_telegram_video(video_path, caption, chat_id, bot_token):
 def normalize_video(input_path, output_path):
     audio_args = [] if has_audio_stream(input_path) else ["-an"]
 
-    # Единый FPS для всех камер (компромисс между 20 и 25)
-    target_fps = 20
-
-    # Базовая команда для NVENC
+    # NVENC (без hwaccel в decode — стабильнее на вашей сборке)
     cmd_nvenc = [
-        "ffmpeg",
-        "-i", str(input_path),
-        "-vf", f"scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,fps={target_fps}",
-        "-c:v", "h264_nvenc", "-preset", "p5",
-        "-b:v", "2M", "-maxrate", "2.5M", "-bufsize", "5M",
+        "ffmpeg", "-i", str(input_path),
+        "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,"
+               "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black",
+        "-r", "20",                    # FPS отдельно — правильно
+        "-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
+        "-profile:v", "high", "-level", "4.1",
+        "-b:v", "1800k", "-maxrate", "2200k", "-bufsize", "4400k",
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "96k",
+        "-force_key_frames", "expr:gte(t,n_forced*2)",
+        "-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "1",  # ← КРИТИЧНО
+        "-async", "1", "-vsync", "cfr",   # ← синхронизация
         "-movflags", "+faststart",
         "-y", str(output_path)
     ] + audio_args
 
-    # Запасная программная команда (libx264)
+    # CPU fallback
     cmd_sw = [
-        "ffmpeg",
-        "-i", str(input_path),
-        "-vf", f"scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,fps={target_fps}",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+        "ffmpeg", "-i", str(input_path),
+        "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,"
+               "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black",
+        "-r", "20",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "24",
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "96k",
+        "-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "1",
+        "-async", "1", "-vsync", "cfr",
         "-movflags", "+faststart",
         "-y", str(output_path)
     ] + audio_args
 
     try:
         with nvenc_semaphore:
-            run_ffmpeg(cmd_nvenc)
+            run_ffmpeg(cmd_nvenc, timeout=360)
+        logger.info(f"Normalized with NVENC: {input_path.name}")
     except Exception as e:
-        logger.warning(f"NVENC failed for {input_path.name}, falling back to software encoding. Error: {e}")
-        run_ffmpeg(cmd_sw)
+        logger.warning(f"NVENC failed → CPU fallback: {e}")
+        run_ffmpeg(cmd_sw, timeout=600)
+        logger.info(f"Normalized with CPU: {input_path.name}")
+
     os.chmod(output_path, 0o664)
     logger.info(f"Normalized: {output_path.name} ({os.path.getsize(output_path)/1024/1024:.2f} MB)")
 
@@ -343,17 +349,23 @@ def split_video(input_path, prefix):
 
         # NVENC команда для сегмента
         cmd_nvenc = [
-            "ffmpeg",
-            "-i", str(input_path), "-ss", str(current), "-t", str(segment_duration),
-            "-c:v", "h264_nvenc", "-preset", "p5",
-            "-b:v", "2M", "-maxrate", "2.5M", "-bufsize", "5M",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-        ]
+            "ffmpeg", "-i", str(input_path), "-ss", str(current), "-t", str(segment_duration),
+            "-vf", "scale=1280:720",  # упрощаем, паддинг не обязателен
+            "-r", "20",
+            "-c:v", "h264_nvenc", "-preset", "p4",
+            "-b:v", "1800k", "-maxrate", "2200k", "-bufsize", "4400k",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "1",
+            "-async", "1", "-vsync", "cfr",
+            "-movflags", "+faststart",
+            "-y", str(out)
+            ]
         # Программная команда для сегмента
         cmd_sw = [
             "ffmpeg",
             "-i", str(input_path), "-ss", str(current), "-t", str(segment_duration),
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-ar", "48000", "-ac", "1", "-async", "1", "-vsync", "cfr",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         ]
         if has_audio:
@@ -523,14 +535,19 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
         # Конкатенация с fallback
         concat_cmd_nvenc = [
             "ffmpeg", "-f", "concat", "-safe", "0", "-i", str(list_file),
-            "-c:v", "h264_nvenc", "-preset", "p5",
-            "-b:v", "2M", "-maxrate", "2.5M", "-bufsize", "5M",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            "-r", "20",          # фиксируем FPS
+            "-c:v", "h264_nvenc", "-preset", "p4",
+            "-b:v", "1800k", "-maxrate", "2200k", "-bufsize", "4400k",
+            "-r", "20",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "1",
+            "-async", "1", "-vsync", "cfr",
+            "-movflags", "+faststart",
+            "-y", str(merged)
         ]
         concat_cmd_sw = [
             "ffmpeg", "-f", "concat", "-safe", "0", "-i", str(list_file),
             "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+            "-ar", "48000", "-ac", "1", "-async", "1", "-vsync", "cfr",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
             "-r", "20",          # фиксируем FPS
         ]
