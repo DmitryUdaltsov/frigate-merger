@@ -39,7 +39,7 @@ merge_lock = threading.Lock()
 event_descriptions = {}
 event_faces = {}  # {event_id: [{"name": str, "score": float}, ...]}
 
-# Семафор для ограничения параллельных NVENC сессий (1 одновременно)
+# Семафор для ограничения параллельных NVENC сессий (1 одновременно — безопасно для GTX 1650)
 nvenc_semaphore = threading.Semaphore(1)
 
 # ========== ЛОГГЕР ==========
@@ -216,7 +216,7 @@ def send_telegram_video(video_path, caption, chat_id, bot_token):
     logger.error(f"Failed to send {video_path.name} to {chat_id} after {TELEGRAM_RETRY_ATTEMPTS} attempts")
     return False
 
-# ========== НОРМАЛИЗАЦИЯ С FALLBACK И РАЗНЫМ FPS ДЛЯ КАМЕР ==========
+# ========== НОРМАЛИЗАЦИЯ С FALLBACK И СТАБИЛЬНОЙ СИНХРОНИЗАЦИЕЙ ==========
 def normalize_video(input_path, output_path):
     audio_args = [] if has_audio_stream(input_path) else ["-an"]
 
@@ -231,8 +231,8 @@ def normalize_video(input_path, output_path):
         "-b:v", "1800k", "-maxrate", "2200k", "-bufsize", "4400k",
         "-pix_fmt", "yuv420p",
         "-force_key_frames", "expr:gte(t,n_forced*2)",
-        "-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "1",  # ← КРИТИЧНО
-        "-async", "1", "-vsync", "cfr",   # ← синхронизация
+        "-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "1",
+        "-async", "1", "-vsync", "cfr",   # принудительная синхронизация
         "-movflags", "+faststart",
         "-y", str(output_path)
     ] + audio_args
@@ -323,7 +323,7 @@ def download_clip(event_id, camera, start_time):
     logger.info(f"Downloaded: {video_path.name}" + (f" + snapshot" if snapshot_ok else ""))
     return (video_path, snapshot_path if snapshot_ok else None)
 
-# ========== РАЗБИЕНИЕ С FALLBACK ==========
+# ========== РАЗБИЕНИЕ С FALLBACK (единые параметры) ==========
 def split_video(input_path, prefix):
     size_mb = os.path.getsize(input_path) / (1024 * 1024)
     if size_mb <= MAX_SAFE_SIZE_MB:
@@ -343,6 +343,9 @@ def split_video(input_path, prefix):
     index = 1
     has_audio = has_audio_stream(input_path)
 
+    # Единый видеофильтр для всех сегментов (сохраняет пропорции и добавляет паддинг)
+    vf_scale_pad = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black"
+
     while current < duration - 0.1:
         out = SEND_DIR / f"{prefix}_p{index:03d}.mp4"
         logger.info(f"Creating segment {out.name} from {current:.2f}s to {current+segment_duration:.2f}s")
@@ -350,7 +353,7 @@ def split_video(input_path, prefix):
         # NVENC команда для сегмента
         cmd_nvenc = [
             "ffmpeg", "-i", str(input_path), "-ss", str(current), "-t", str(segment_duration),
-            "-vf", "scale=1280:720",  # упрощаем, паддинг не обязателен
+            "-vf", vf_scale_pad,
             "-r", "20",
             "-c:v", "h264_nvenc", "-preset", "p4",
             "-b:v", "1800k", "-maxrate", "2200k", "-bufsize", "4400k",
@@ -359,23 +362,23 @@ def split_video(input_path, prefix):
             "-async", "1", "-vsync", "cfr",
             "-movflags", "+faststart",
             "-y", str(out)
-            ]
-        # Программная команда для сегмента
-        cmd_sw = [
-            "ffmpeg",
-            "-i", str(input_path), "-ss", str(current), "-t", str(segment_duration),
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-ar", "48000", "-ac", "1", "-async", "1", "-vsync", "cfr",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         ]
-        if has_audio:
-            cmd_nvenc.extend(["-c:a", "aac", "-b:a", "64k"])
-            cmd_sw.extend(["-c:a", "aac", "-b:a", "64k"])
-        else:
-            cmd_nvenc.append("-an")
-            cmd_sw.append("-an")
-        cmd_nvenc.extend(["-y", str(out)])
-        cmd_sw.extend(["-y", str(out)])
+        # Программная команда для сегмента (теперь с теми же параметрами аудио и синхронизации)
+        cmd_sw = [
+            "ffmpeg", "-i", str(input_path), "-ss", str(current), "-t", str(segment_duration),
+            "-vf", vf_scale_pad,
+            "-r", "20",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "1",
+            "-async", "1", "-vsync", "cfr",
+            "-movflags", "+faststart",
+            "-y", str(out)
+        ]
+        if not has_audio:
+            # Если аудио нет, убираем аудиопараметры
+            cmd_nvenc = [x for x in cmd_nvenc if not x.startswith(('-c:a', '-b:a', '-ar', '-ac', '-async'))] + ["-an"]
+            cmd_sw   = [x for x in cmd_sw   if not x.startswith(('-c:a', '-b:a', '-ar', '-ac', '-async'))] + ["-an"]
 
         try:
             with nvenc_semaphore:
@@ -532,13 +535,13 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
 
         merged = NEW_DIR / f"merged_{int(time.time())}.mp4"
 
-        # Конкатенация с fallback
+        # Конкатенация с fallback — теперь обе ветки имеют одинаковые параметры аудио и синхронизации
         concat_cmd_nvenc = [
             "ffmpeg", "-f", "concat", "-safe", "0", "-i", str(list_file),
             "-c:v", "h264_nvenc", "-preset", "p4",
             "-b:v", "1800k", "-maxrate", "2200k", "-bufsize", "4400k",
-            "-r", "20",
             "-pix_fmt", "yuv420p",
+            "-r", "20",
             "-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "1",
             "-async", "1", "-vsync", "cfr",
             "-movflags", "+faststart",
@@ -547,18 +550,17 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
         concat_cmd_sw = [
             "ffmpeg", "-f", "concat", "-safe", "0", "-i", str(list_file),
             "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-            "-ar", "48000", "-ac", "1", "-async", "1", "-vsync", "cfr",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            "-r", "20",          # фиксируем FPS
+            "-pix_fmt", "yuv420p",
+            "-r", "20",
+            "-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "1",
+            "-async", "1", "-vsync", "cfr",
+            "-movflags", "+faststart",
+            "-y", str(merged)
         ]
-        if has_audio_stream(normalized[0]):
-            concat_cmd_nvenc.extend(["-c:a", "aac", "-b:a", "64k"])
-            concat_cmd_sw.extend(["-c:a", "aac", "-b:a", "64k"])
-        else:
-            concat_cmd_nvenc.append("-an")
-            concat_cmd_sw.append("-an")
-        concat_cmd_nvenc.extend(["-y", str(merged)])
-        concat_cmd_sw.extend(["-y", str(merged)])
+        if not has_audio_stream(normalized[0]):
+            # Убираем аудиопараметры, если нет аудио
+            concat_cmd_nvenc = [x for x in concat_cmd_nvenc if not x.startswith(('-c:a', '-b:a', '-ar', '-ac', '-async'))] + ["-an"]
+            concat_cmd_sw   = [x for x in concat_cmd_sw   if not x.startswith(('-c:a', '-b:a', '-ar', '-ac', '-async'))] + ["-an"]
 
         try:
             with nvenc_semaphore:
