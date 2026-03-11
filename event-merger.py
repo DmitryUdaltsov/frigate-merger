@@ -220,12 +220,8 @@ def send_telegram_video(video_path, caption, chat_id, bot_token):
 def normalize_video(input_path, output_path):
     audio_args = [] if has_audio_stream(input_path) else ["-an"]
 
-    # Определяем целевой FPS по имени файла (в имени есть камера)
-    filename = str(input_path).lower()
-    if "domofon" in filename:
-        target_fps = 25   # для домофона сохраняем 25 fps
-    else:
-        target_fps = 15   # для остальных 15 fps
+    # Единый FPS для всех камер (компромисс между 20 и 25)
+    target_fps = 20
 
     # Базовая команда для NVENC
     cmd_nvenc = [
