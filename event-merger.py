@@ -526,11 +526,13 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
             "-c:v", "h264_nvenc", "-preset", "p5",
             "-b:v", "2M", "-maxrate", "2.5M", "-bufsize", "5M",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-r", "20",          # фиксируем FPS
         ]
         concat_cmd_sw = [
             "ffmpeg", "-f", "concat", "-safe", "0", "-i", str(list_file),
             "-c:v", "libx264", "-preset", "medium", "-crf", "23",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-r", "20",          # фиксируем FPS
         ]
         if has_audio_stream(normalized[0]):
             concat_cmd_nvenc.extend(["-c:a", "aac", "-b:a", "64k"])
