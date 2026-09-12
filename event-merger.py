@@ -15,7 +15,9 @@ import subprocess
 import threading
 import queue
 import shutil
+from contextlib import ExitStack
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 import paho.mqtt.client as mqtt
@@ -41,6 +43,7 @@ event_faces = {}  # {event_id: [{"name": str, "score": float}, ...]}
 
 # Семафор для ограничения параллельных NVENC сессий (1 одновременно — безопасно для GTX 1650)
 nvenc_semaphore = threading.Semaphore(1)
+delivery_lock = threading.Lock()
 
 # ========== ЛОГГЕР ==========
 logging.basicConfig(
@@ -49,6 +52,14 @@ logging.basicConfig(
     stream=sys.stdout
 )
 logger = logging.getLogger("event-merger")
+
+# Дополнительные настройки имеют безопасные значения по умолчанию, поэтому
+# старый config.py продолжит работать без изменений.
+FRIGATE_CLIP_PRE_CAPTURE = float(globals().get("FRIGATE_CLIP_PRE_CAPTURE", 1))
+FRIGATE_CLIP_POST_CAPTURE = float(globals().get("FRIGATE_CLIP_POST_CAPTURE", 1))
+FRIGATE_CLIP_FINALIZE_DELAY = float(globals().get("FRIGATE_CLIP_FINALIZE_DELAY", 10))
+FRIGATE_CLIP_DURATION_TOLERANCE = float(globals().get("FRIGATE_CLIP_DURATION_TOLERANCE", 3))
+TELEGRAM_PENDING_RETRY_INTERVAL = int(globals().get("TELEGRAM_PENDING_RETRY_INTERVAL", 300))
 
 # ========== УТИЛИТЫ ==========
 def has_audio_stream(path):
@@ -160,40 +171,36 @@ def send_telegram_media_group(video_path, photo_path, caption, chat_id, bot_toke
     proxies = get_proxies()
 
     media = []
-    files = {}
-    try:
-        if photo_path and Path(photo_path).exists():
-            media.append({
-                'type': 'photo',
-                'media': 'attach://photo',
-                'caption': caption,
-            })
-            files['photo'] = open(photo_path, 'rb')
+    if photo_path and Path(photo_path).exists():
         media.append({
-            'type': 'video',
-            'media': 'attach://video',
+            'type': 'photo',
+            'media': 'attach://photo',
+            'caption': caption,
         })
-        files['video'] = open(video_path, 'rb')
+    media.append({
+        'type': 'video',
+        'media': 'attach://video',
+    })
+    payload = {'chat_id': chat_id, 'media': json.dumps(media)}
 
-        payload = {
-            'chat_id': chat_id,
-            'media': json.dumps(media)
-        }
-
-        for attempt in range(1, TELEGRAM_RETRY_ATTEMPTS + 1):
-            try:
+    for attempt in range(1, TELEGRAM_RETRY_ATTEMPTS + 1):
+        response = None
+        try:
+            with ExitStack() as stack:
+                files = {}
+                if photo_path and Path(photo_path).exists():
+                    files['photo'] = stack.enter_context(open(photo_path, 'rb'))
+                files['video'] = stack.enter_context(open(video_path, 'rb'))
                 response = requests.post(url, data=payload, files=files, timeout=60, proxies=proxies)
                 response.raise_for_status()
                 logger.info(f"Media group sent to {chat_id}: {video_path.name}")
                 return True
-            except Exception as e:
-                logger.warning(f"Media group attempt {attempt} to {chat_id} failed: {e}")
-                if attempt < TELEGRAM_RETRY_ATTEMPTS:
-                    time.sleep(TELEGRAM_RETRY_DELAY)
-        return False
-    finally:
-        for f in files.values():
-            f.close()
+        except Exception as e:
+            details = getattr(response, 'text', '')
+            logger.warning(f"Media group attempt {attempt} to {chat_id} failed: {e}; {details[:500]}")
+        if attempt < TELEGRAM_RETRY_ATTEMPTS:
+            time.sleep(TELEGRAM_RETRY_DELAY)
+    return False
 
 def send_telegram_video(video_path, caption, chat_id, bot_token):
     """Отправляет только видео в указанный чат."""
@@ -201,6 +208,7 @@ def send_telegram_video(video_path, caption, chat_id, bot_token):
     proxies = get_proxies()
 
     for attempt in range(1, TELEGRAM_RETRY_ATTEMPTS + 1):
+        response = None
         try:
             with open(video_path, 'rb') as video_file:
                 files = {'video': video_file}
@@ -210,46 +218,176 @@ def send_telegram_video(video_path, caption, chat_id, bot_token):
                 logger.info(f"Video sent to {chat_id}: {video_path.name}")
                 return True
         except Exception as e:
-            logger.warning(f"Video send attempt {attempt} to {chat_id} failed: {e}")
+            details = getattr(response, 'text', '')
+            logger.warning(f"Video send attempt {attempt} to {chat_id} failed: {e}; {details[:500]}")
             if attempt < TELEGRAM_RETRY_ATTEMPTS:
                 time.sleep(TELEGRAM_RETRY_DELAY)
     logger.error(f"Failed to send {video_path.name} to {chat_id} after {TELEGRAM_RETRY_ATTEMPTS} attempts")
     return False
 
+def delivery_state_path(video_path):
+    return SEND_DIR / f"{Path(video_path).name}.delivery.json"
+
+def write_delivery_state(state_path, state):
+    """Атомарно сохраняет состояние доставки без токенов Telegram."""
+    temp_path = state_path.with_suffix(state_path.suffix + ".tmp")
+    with open(temp_path, "w", encoding="utf-8") as state_file:
+        json.dump(state, state_file, ensure_ascii=False, indent=2)
+    temp_path.replace(state_path)
+
+def configured_delivery_targets(caption, include_second_chat):
+    targets = [{
+        "name": "primary",
+        "chat_id": str(TELEGRAM_CHAT_ID),
+        "caption": caption,
+        "sent": False,
+    }]
+    if include_second_chat and SECOND_TELEGRAM_CHAT_ID:
+        targets.append({
+            "name": "secondary",
+            "chat_id": str(SECOND_TELEGRAM_CHAT_ID),
+            "caption": "",
+            "sent": False,
+        })
+    return targets
+
+def attempt_pending_delivery(state_path):
+    """Отправляет ещё не доставленные адресатам вложения и удаляет только после полного успеха."""
+    state_path = Path(state_path)
+    try:
+        with open(state_path, "r", encoding="utf-8") as state_file:
+            state = json.load(state_file)
+    except Exception as e:
+        logger.error(f"Cannot read delivery state {state_path.name}: {e}")
+        return False
+
+    video_path = SEND_DIR / state["video"]
+    snapshot_name = state.get("snapshot")
+    snapshot_path = SEND_DIR / snapshot_name if snapshot_name else None
+    if not video_path.exists():
+        logger.error(f"Pending video is missing: {video_path}")
+        return False
+
+    for target in state["targets"]:
+        if target.get("sent"):
+            continue
+        bot_token = (
+            SECOND_TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN
+            if target["name"] == "secondary"
+            else TELEGRAM_BOT_TOKEN
+        )
+        if snapshot_path and snapshot_path.exists():
+            sent = send_telegram_media_group(
+                video_path, snapshot_path, target.get("caption", ""),
+                target["chat_id"], bot_token
+            )
+        else:
+            sent = send_telegram_video(
+                video_path, target.get("caption", ""),
+                target["chat_id"], bot_token
+            )
+        if sent:
+            target["sent"] = True
+            write_delivery_state(state_path, state)
+
+    if all(target.get("sent") for target in state["targets"]):
+        video_path.unlink(missing_ok=True)
+        if snapshot_path:
+            snapshot_path.unlink(missing_ok=True)
+        state_path.unlink(missing_ok=True)
+        logger.info(f"Delivery completed and files deleted: {video_path.name}")
+        return True
+
+    logger.warning(f"Delivery remains pending: {video_path.name}")
+    return False
+
+def queue_delivery(video_path, snapshot_path, caption, include_second_chat=True):
+    """Ставит готовый файл в сохраняемую очередь и сразу делает первую попытку."""
+    video_path = Path(video_path)
+    snapshot_path = Path(snapshot_path) if snapshot_path else None
+    state_path = delivery_state_path(video_path)
+    state = {
+        "video": video_path.name,
+        "snapshot": snapshot_path.name if snapshot_path else None,
+        "targets": configured_delivery_targets(caption, include_second_chat),
+        "created_at": time.time(),
+    }
+    with delivery_lock:
+        write_delivery_state(state_path, state)
+        return attempt_pending_delivery(state_path)
+
+def retry_pending_deliveries():
+    with delivery_lock:
+        states = sorted(SEND_DIR.glob("*.delivery.json"))
+        if states:
+            logger.info(f"Retrying {len(states)} pending Telegram deliveries")
+        for state_path in states:
+            attempt_pending_delivery(state_path)
+
+def recover_untracked_send_files():
+    """Подхватывает файлы, оставленные старой версией после неудачной отправки."""
+    for video_path in sorted(SEND_DIR.glob("*.mp4")):
+        if delivery_state_path(video_path).exists():
+            continue
+        size_mb = video_path.stat().st_size / (1024 * 1024)
+        if size_mb > MAX_SAFE_SIZE_MB:
+            logger.warning(f"Legacy pending file is too large for Telegram: {video_path.name}")
+            continue
+        snapshot_path = video_path.with_suffix(".jpg")
+        queue_delivery(
+            video_path,
+            snapshot_path if snapshot_path.exists() else None,
+            "Повторная отправка сохранённого события",
+            include_second_chat=True,
+        )
+
+def delivery_retry_loop():
+    while True:
+        try:
+            retry_pending_deliveries()
+        except Exception as e:
+            logger.error(f"Pending delivery retry failed: {e}")
+        time.sleep(max(30, TELEGRAM_PENDING_RETRY_INTERVAL))
+
 # ========== НОРМАЛИЗАЦИЯ С FALLBACK И СТАБИЛЬНОЙ СИНХРОНИЗАЦИЕЙ ==========
 def normalize_video(input_path, output_path):
-    audio_args = [] if has_audio_stream(input_path) else ["-an"]
+    input_duration = get_duration(input_path)
+    has_audio = has_audio_stream(input_path)
+    video_filter = (
+        "scale=1280:720:force_original_aspect_ratio=decrease,"
+        "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,"
+        "setpts=PTS-STARTPTS,fps=20"
+    )
+    audio_args = (
+        ["-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "1",
+         "-af", "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0"]
+        if has_audio else ["-an"]
+    )
 
     # NVENC (без hwaccel в decode — стабильнее на вашей сборке)
     cmd_nvenc = [
         "ffmpeg", "-i", str(input_path),
-        "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,"
-               "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black",
-        "-r", "20",                    # FPS отдельно — правильно
+        "-vf", video_filter,
         "-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
         "-profile:v", "high", "-level", "4.1",
         "-b:v", "1800k", "-maxrate", "2200k", "-bufsize", "4400k",
         "-pix_fmt", "yuv420p",
         "-force_key_frames", "expr:gte(t,n_forced*2)",
-        "-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "1",
-        "-async", "1", "-vsync", "cfr",   # принудительная синхронизация
+    ] + audio_args + [
         "-movflags", "+faststart",
         "-y", str(output_path)
-    ] + audio_args
+    ]
 
     # CPU fallback
     cmd_sw = [
         "ffmpeg", "-i", str(input_path),
-        "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,"
-               "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black",
-        "-r", "20",
+        "-vf", video_filter,
         "-c:v", "libx264", "-preset", "fast", "-crf", "24",
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "1",
-        "-async", "1", "-vsync", "cfr",
+    ] + audio_args + [
         "-movflags", "+faststart",
         "-y", str(output_path)
-    ] + audio_args
+    ]
 
     try:
         with nvenc_semaphore:
@@ -260,13 +398,46 @@ def normalize_video(input_path, output_path):
         run_ffmpeg(cmd_sw, timeout=600)
         logger.info(f"Normalized with CPU: {input_path.name}")
 
+    output_duration = get_duration(output_path)
+    if input_duration > 0 and output_duration < input_duration - 1:
+        output_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Normalization shortened video from {input_duration:.2f}s to {output_duration:.2f}s"
+        )
     os.chmod(output_path, 0o664)
-    logger.info(f"Normalized: {output_path.name} ({os.path.getsize(output_path)/1024/1024:.2f} MB)")
+    logger.info(
+        f"Normalized: {output_path.name}, duration {input_duration:.2f}s -> "
+        f"{output_duration:.2f}s ({os.path.getsize(output_path)/1024/1024:.2f} MB)"
+    )
 
 # ========== СКАЧИВАНИЕ ==========
-def download_clip(event_id, camera, start_time):
-    """Скачивает видео и snapshot. Возвращает (video_path, snapshot_path)."""
-    video_url = f"{FRIGATE_API_URL}/api/events/{event_id}/clip.mp4"
+def download_clip(event_id, camera, start_time, end_time=None):
+    """Скачивает полный диапазон события с pre/post capture и snapshot."""
+    expected_duration = None
+    if end_time:
+        clip_start = float(start_time) - FRIGATE_CLIP_PRE_CAPTURE
+        clip_end = float(end_time) + FRIGATE_CLIP_POST_CAPTURE
+        expected_duration = clip_end - clip_start
+        camera_path = quote(str(camera), safe="")
+        video_url = (
+            f"{FRIGATE_API_URL}/api/{camera_path}/start/{clip_start:.3f}"
+            f"/end/{clip_end:.3f}/clip.mp4"
+        )
+
+        # MQTT end описывает конец детекции, но post-capture и последний 10-секундный
+        # сегмент записи ещё могут находиться в кеше Frigate.
+        ready_at = clip_end + FRIGATE_CLIP_FINALIZE_DELAY
+        wait_seconds = max(0, ready_at - time.time())
+        if wait_seconds:
+            logger.info(
+                f"Waiting {wait_seconds:.1f}s for Frigate to finalize clip {event_id} "
+                f"({expected_duration:.1f}s expected)"
+            )
+            time.sleep(wait_seconds)
+    else:
+        logger.warning(f"Event {event_id} has no end_time; using object clip endpoint")
+        video_url = f"{FRIGATE_API_URL}/api/events/{event_id}/clip.mp4"
+
     snapshot_url = f"{FRIGATE_API_URL}/api/events/{event_id}/snapshot.jpg"
     filename_base = f"{int(start_time)}_{camera}_{event_id}"
     video_path = NEW_DIR / f"{filename_base}.mp4"
@@ -282,14 +453,29 @@ def download_clip(event_id, camera, start_time):
                 with open(video_path, "wb") as f:
                     for chunk in r.iter_content(8192):
                         f.write(chunk)
-            if get_duration(video_path) < 1:
+            downloaded_duration = get_duration(video_path)
+            minimum_duration = (
+                max(1, expected_duration - FRIGATE_CLIP_DURATION_TOLERANCE)
+                if expected_duration else 1
+            )
+            if downloaded_duration < minimum_duration:
                 video_path.unlink(missing_ok=True)
-                logger.warning(f"Video {video_path.name} zero duration, retrying...")
+                logger.warning(
+                    f"Video {video_path.name} is incomplete: {downloaded_duration:.2f}s, "
+                    f"expected at least {minimum_duration:.2f}s; retrying"
+                )
+                if attempt < MAX_DOWNLOAD_ATTEMPTS:
+                    time.sleep(DOWNLOAD_RETRY_DELAY)
                 continue
             os.chmod(video_path, 0o664)
             video_ok = True
+            logger.info(
+                f"Downloaded clip duration: {downloaded_duration:.2f}s"
+                + (f" (requested {expected_duration:.2f}s)" if expected_duration else "")
+            )
             break
         except Exception as e:
+            video_path.unlink(missing_ok=True)
             logger.warning(f"Video download attempt {attempt} failed for {event_id}: {e}")
             if attempt < MAX_DOWNLOAD_ATTEMPTS:
                 time.sleep(DOWNLOAD_RETRY_DELAY)
@@ -344,7 +530,16 @@ def split_video(input_path, prefix):
     has_audio = has_audio_stream(input_path)
 
     # Единый видеофильтр для всех сегментов (сохраняет пропорции и добавляет паддинг)
-    vf_scale_pad = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black"
+    vf_scale_pad = (
+        "scale=1280:720:force_original_aspect_ratio=decrease,"
+        "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,"
+        "setpts=PTS-STARTPTS,fps=20"
+    )
+    audio_args = (
+        ["-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "1",
+         "-af", "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0"]
+        if has_audio else ["-an"]
+    )
 
     while current < duration - 0.1:
         out = SEND_DIR / f"{prefix}_p{index:03d}.mp4"
@@ -354,12 +549,10 @@ def split_video(input_path, prefix):
         cmd_nvenc = [
             "ffmpeg", "-i", str(input_path), "-ss", str(current), "-t", str(segment_duration),
             "-vf", vf_scale_pad,
-            "-r", "20",
             "-c:v", "h264_nvenc", "-preset", "p4",
             "-b:v", "1800k", "-maxrate", "2200k", "-bufsize", "4400k",
             "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "1",
-            "-async", "1", "-vsync", "cfr",
+        ] + audio_args + [
             "-movflags", "+faststart",
             "-y", str(out)
         ]
@@ -367,18 +560,12 @@ def split_video(input_path, prefix):
         cmd_sw = [
             "ffmpeg", "-i", str(input_path), "-ss", str(current), "-t", str(segment_duration),
             "-vf", vf_scale_pad,
-            "-r", "20",
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
             "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "1",
-            "-async", "1", "-vsync", "cfr",
+        ] + audio_args + [
             "-movflags", "+faststart",
             "-y", str(out)
         ]
-        if not has_audio:
-            # Если аудио нет, убираем аудиопараметры
-            cmd_nvenc = [x for x in cmd_nvenc if not x.startswith(('-c:a', '-b:a', '-ar', '-ac', '-async'))] + ["-an"]
-            cmd_sw   = [x for x in cmd_sw   if not x.startswith(('-c:a', '-b:a', '-ar', '-ac', '-async'))] + ["-an"]
 
         try:
             with nvenc_semaphore:
@@ -414,8 +601,9 @@ def split_video(input_path, prefix):
 def process_single_video(video_path, snapshot_path, event_id, description, faces_list, camera):
     logger.info(f"Processing single video from {camera}: {video_path.name}")
 
-    temp_dir = TEMP_DIR / f"single_{int(time.time())}_{camera}"
+    temp_dir = TEMP_DIR / f"single_{time.time_ns()}_{camera}"
     temp_dir.mkdir(exist_ok=True)
+    source_is_safe = False
 
     try:
         norm_path = temp_dir / f"norm_{video_path.stem}.mp4"
@@ -445,43 +633,41 @@ def process_single_video(video_path, snapshot_path, event_id, description, faces
                 caption = "Обнаружено движение"
 
         if size_mb <= MAX_SAFE_SIZE_MB:
+            final_video = SEND_DIR / f"single_{video_path.stem}.mp4"
+            shutil.move(str(norm_path), str(final_video))
+            final_snapshot = None
             if snapshot_path and Path(snapshot_path).exists():
-                ok = send_telegram_media_group(
-                    norm_path, snapshot_path, caption,
-                    TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN
-                )
-            else:
-                ok = send_telegram_video(
-                    norm_path, caption,
-                    TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN
-                )
-            if ok:
-                logger.info(f"Single video sent: {norm_path.name}")
-                norm_path.unlink(missing_ok=True)
-            else:
-                logger.error(f"Failed to send single video {norm_path.name}, keeping in temp")
+                final_snapshot = SEND_DIR / f"single_{video_path.stem}.jpg"
+                shutil.copy2(str(snapshot_path), str(final_snapshot))
+            queue_delivery(final_video, final_snapshot, caption, include_second_chat=False)
+            source_is_safe = True
         else:
             parts = split_video(norm_path, f"{norm_path.stem}_part")
-            all_sent = True
-            for part in parts:
-                if send_telegram_video(part, caption, TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN):
-                    part.unlink(missing_ok=True)
-                else:
-                    all_sent = False
-                    logger.error(f"Failed to send part {part.name}, keeping")
-            if all_sent:
-                logger.info("All parts of single video sent")
+            split_duration = sum(get_duration(part) for part in parts)
+            original_duration = get_duration(norm_path)
+            if parts and split_duration >= original_duration - 0.5:
+                for part in parts:
+                    queue_delivery(part, None, caption, include_second_chat=False)
                 norm_path.unlink(missing_ok=True)
+                source_is_safe = True
             else:
-                logger.warning("Some parts of single video failed to send")
+                preserved_video = SEND_DIR / f"oversized_{video_path.stem}.mp4"
+                shutil.move(str(norm_path), str(preserved_video))
+                source_is_safe = True
+                logger.error(
+                    f"Split incomplete; full video preserved without deletion: {preserved_video.name}"
+                )
     finally:
         if temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
-        video_path.unlink(missing_ok=True)
-        if snapshot_path:
-            snapshot_path.unlink(missing_ok=True)
-        event_descriptions.pop(event_id, None)
-        event_faces.pop(event_id, None)
+        if source_is_safe:
+            video_path.unlink(missing_ok=True)
+            if snapshot_path:
+                snapshot_path.unlink(missing_ok=True)
+            event_descriptions.pop(event_id, None)
+            event_faces.pop(event_id, None)
+        else:
+            logger.warning(f"Source retained for recovery: {video_path}")
 
 # ========== ОБРАБОТКА ПАЧКИ ОБЫЧНЫХ ВИДЕО ==========
 def process_batch(file_paths):  # список кортежей (video_path, snapshot_path, event_id, description, faces_list)
@@ -512,8 +698,10 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
 
     first_snapshot = file_paths[0][1] if file_paths[0][1] and Path(file_paths[0][1]).exists() else None
 
-    temp_dir = TEMP_DIR / f"batch_{int(time.time())}"
+    temp_dir = TEMP_DIR / f"batch_{time.time_ns()}"
     temp_dir.mkdir(exist_ok=True)
+    normalized_sources = []
+    output_is_safe = False
 
     try:
         normalized = []
@@ -522,6 +710,7 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
             try:
                 normalize_video(video_path, norm)
                 normalized.append(norm)
+                normalized_sources.append((video_path, snap_path, eid))
             except Exception as e:
                 logger.error(f"Normalization failed {video_path}: {e}")
 
@@ -533,34 +722,36 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
             for nf in normalized:
                 lf.write(f"file '{nf}'\n")
 
-        merged = NEW_DIR / f"merged_{int(time.time())}.mp4"
+        merged = NEW_DIR / f"merged_{time.time_ns()}.mp4"
 
-        # Конкатенация с fallback — теперь обе ветки имеют одинаковые параметры аудио и синхронизации
+        # Нормализованные клипы начинаются с нулевых PTS; повторно сбрасываем
+        # временную шкалу после concat, чтобы Telegram не видел пустое начало.
+        concat_has_audio = has_audio_stream(normalized[0])
+        concat_audio_args = (
+            ["-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "1",
+             "-af", "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0"]
+            if concat_has_audio else ["-an"]
+        )
+        concat_video_filter = "setpts=PTS-STARTPTS,fps=20"
         concat_cmd_nvenc = [
             "ffmpeg", "-f", "concat", "-safe", "0", "-i", str(list_file),
+            "-vf", concat_video_filter,
             "-c:v", "h264_nvenc", "-preset", "p4",
             "-b:v", "1800k", "-maxrate", "2200k", "-bufsize", "4400k",
             "-pix_fmt", "yuv420p",
-            "-r", "20",
-            "-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "1",
-            "-async", "1", "-vsync", "cfr",
+        ] + concat_audio_args + [
             "-movflags", "+faststart",
             "-y", str(merged)
         ]
         concat_cmd_sw = [
             "ffmpeg", "-f", "concat", "-safe", "0", "-i", str(list_file),
+            "-vf", concat_video_filter,
             "-c:v", "libx264", "-preset", "medium", "-crf", "23",
             "-pix_fmt", "yuv420p",
-            "-r", "20",
-            "-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "1",
-            "-async", "1", "-vsync", "cfr",
+        ] + concat_audio_args + [
             "-movflags", "+faststart",
             "-y", str(merged)
         ]
-        if not has_audio_stream(normalized[0]):
-            # Убираем аудиопараметры, если нет аудио
-            concat_cmd_nvenc = [x for x in concat_cmd_nvenc if not x.startswith(('-c:a', '-b:a', '-ar', '-ac', '-async'))] + ["-an"]
-            concat_cmd_sw   = [x for x in concat_cmd_sw   if not x.startswith(('-c:a', '-b:a', '-ar', '-ac', '-async'))] + ["-an"]
 
         try:
             with nvenc_semaphore:
@@ -568,6 +759,15 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
         except Exception as e:
             logger.warning(f"NVENC concat failed, falling back to software encoding. Error: {e}")
             run_ffmpeg(concat_cmd_sw)
+
+        expected_merged_duration = sum(get_duration(path) for path in normalized)
+        actual_merged_duration = get_duration(merged)
+        if actual_merged_duration < expected_merged_duration - 1:
+            merged.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"Concat shortened video from {expected_merged_duration:.2f}s "
+                f"to {actual_merged_duration:.2f}s"
+            )
 
         merged_size_mb = os.path.getsize(merged) / (1024 * 1024)
 
@@ -582,66 +782,32 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
                 shutil.copy2(str(first_snapshot), str(final_snapshot))
                 os.chmod(final_snapshot, 0o664)
 
-            if final_snapshot:
-                ok = send_telegram_media_group(
-                    final_video, final_snapshot, final_description,
-                    TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN
-                )
-            else:
-                ok = send_telegram_video(
-                    final_video, final_description,
-                    TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN
-                )
-
-            if ok:
-                if SECOND_TELEGRAM_CHAT_ID:
-                    if final_snapshot:
-                        send_telegram_media_group(
-                            final_video, final_snapshot, "",
-                            SECOND_TELEGRAM_CHAT_ID,
-                            SECOND_TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN
-                        )
-                    else:
-                        send_telegram_video(
-                            final_video, "",
-                            SECOND_TELEGRAM_CHAT_ID,
-                            SECOND_TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN
-                        )
-                final_video.unlink(missing_ok=True)
-                if final_snapshot:
-                    final_snapshot.unlink(missing_ok=True)
-                logger.info(f"Sent and deleted: {final_video.name}")
-            else:
-                logger.error(f"Failed to send {final_video.name}, keeping files")
+            queue_delivery(final_video, final_snapshot, final_description, include_second_chat=True)
+            output_is_safe = True
         else:
             parts = split_video(merged, merged.stem)
-            merged.unlink(missing_ok=True)
-
-            all_sent = True
-            for part in parts:
-                if send_telegram_video(part, final_description, TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN):
-                    if SECOND_TELEGRAM_CHAT_ID:
-                        send_telegram_video(
-                            part, "",
-                            SECOND_TELEGRAM_CHAT_ID,
-                            SECOND_TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN
-                        )
-                    part.unlink(missing_ok=True)
-                else:
-                    all_sent = False
-                    logger.error(f"Failed to send {part.name}, keeping file")
-
-            if all_sent:
-                logger.info(f"All {len(parts)} parts sent and deleted")
+            split_duration = sum(get_duration(part) for part in parts)
+            merged_duration = get_duration(merged)
+            if parts and split_duration >= merged_duration - 0.5:
+                for part in parts:
+                    queue_delivery(part, None, final_description, include_second_chat=True)
+                merged.unlink(missing_ok=True)
+                output_is_safe = True
             else:
-                logger.warning(f"Some parts failed to send, kept in {SEND_DIR}")
+                preserved_video = SEND_DIR / merged.name
+                shutil.move(str(merged), str(preserved_video))
+                output_is_safe = True
+                logger.error(
+                    f"Split incomplete; full merged video preserved: {preserved_video.name}"
+                )
 
-        for video_path, snap_path, eid, _, _ in file_paths:
-            video_path.unlink(missing_ok=True)
-            if snap_path:
-                snap_path.unlink(missing_ok=True)
-            event_descriptions.pop(eid, None)
-            event_faces.pop(eid, None)
+        if output_is_safe:
+            for video_path, snap_path, eid in normalized_sources:
+                video_path.unlink(missing_ok=True)
+                if snap_path:
+                    snap_path.unlink(missing_ok=True)
+                event_descriptions.pop(eid, None)
+                event_faces.pop(eid, None)
 
     finally:
         if temp_dir.exists():
@@ -656,8 +822,9 @@ def worker_loop():
         data = event_queue.get()
         if not data.get("after", {}).get("id"):
             continue
-        eid, cam, ts = data["after"]["id"], data["after"]["camera"], data["after"]["start_time"]
-        video_path, snap_path = download_clip(eid, cam, ts)
+        event = data["after"]
+        eid, cam, ts = event["id"], event["camera"], event["start_time"]
+        video_path, snap_path = download_clip(eid, cam, ts, event.get("end_time"))
         if video_path:
             raw_desc = event_descriptions.get(eid, "")
             if raw_desc:
@@ -678,8 +845,9 @@ def worker_loop():
 
             try:
                 next_data = event_queue.get(timeout=GROUP_TIMEOUT)
-                neid, ncam, nts = next_data["after"]["id"], next_data["after"]["camera"], next_data["after"]["start_time"]
-                nvideo, nsnap = download_clip(neid, ncam, nts)
+                next_event = next_data["after"]
+                neid, ncam, nts = next_event["id"], next_event["camera"], next_event["start_time"]
+                nvideo, nsnap = download_clip(neid, ncam, nts, next_event.get("end_time"))
                 if nvideo:
                     raw_ndesc = event_descriptions.get(neid, "")
                     if raw_ndesc:
@@ -752,6 +920,9 @@ def on_message(client, userdata, msg):
 
 # ========== MAIN ==========
 def main():
+    recover_untracked_send_files()
+    threading.Thread(target=delivery_retry_loop, daemon=True).start()
+
     initial = list(NEW_DIR.glob("*.mp4"))
     if initial:
         logger.info(f"Startup: {len(initial)} files found → force merge")
