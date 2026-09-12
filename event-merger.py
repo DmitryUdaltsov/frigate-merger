@@ -9,6 +9,7 @@ event-merger.py — объединяет клипы Frigate, отправляе�
 import os
 import sys
 import json
+import re
 import time
 import logging
 import subprocess
@@ -165,6 +166,29 @@ def get_proxies():
         return {"http": proxy_url, "https": proxy_url}
     return None
 
+def redact_telegram_secrets(value, bot_token=None):
+    """Удаляет токены ботов из исключений requests и URL перед логированием."""
+    message = str(value or "")
+    tokens = [
+        bot_token,
+        globals().get("TELEGRAM_BOT_TOKEN"),
+        globals().get("SECOND_TELEGRAM_BOT_TOKEN"),
+    ]
+    for token in tokens:
+        if token:
+            message = message.replace(str(token), "<redacted>")
+    return re.sub(
+        r"(https?://api\.telegram\.org/bot)[^/\s]+",
+        r"\1<redacted>",
+        message,
+        flags=re.IGNORECASE,
+    )
+
+def telegram_error_message(error, response, bot_token):
+    details = getattr(response, "text", "") if response is not None else ""
+    combined = f"{error}; {details[:500]}" if details else str(error)
+    return redact_telegram_secrets(combined, bot_token)
+
 def send_telegram_media_group(video_path, photo_path, caption, chat_id, bot_token):
     """Отправляет фото и видео как группу медиа в указанный чат."""
     url = f"https://api.telegram.org/bot{bot_token}/sendMediaGroup"
@@ -196,8 +220,8 @@ def send_telegram_media_group(video_path, photo_path, caption, chat_id, bot_toke
                 logger.info(f"Media group sent to {chat_id}: {video_path.name}")
                 return True
         except Exception as e:
-            details = getattr(response, 'text', '')
-            logger.warning(f"Media group attempt {attempt} to {chat_id} failed: {e}; {details[:500]}")
+            error_message = telegram_error_message(e, response, bot_token)
+            logger.warning(f"Media group attempt {attempt} to {chat_id} failed: {error_message}")
         if attempt < TELEGRAM_RETRY_ATTEMPTS:
             time.sleep(TELEGRAM_RETRY_DELAY)
     return False
@@ -218,8 +242,8 @@ def send_telegram_video(video_path, caption, chat_id, bot_token):
                 logger.info(f"Video sent to {chat_id}: {video_path.name}")
                 return True
         except Exception as e:
-            details = getattr(response, 'text', '')
-            logger.warning(f"Video send attempt {attempt} to {chat_id} failed: {e}; {details[:500]}")
+            error_message = telegram_error_message(e, response, bot_token)
+            logger.warning(f"Video send attempt {attempt} to {chat_id} failed: {error_message}")
             if attempt < TELEGRAM_RETRY_ATTEMPTS:
                 time.sleep(TELEGRAM_RETRY_DELAY)
     logger.error(f"Failed to send {video_path.name} to {chat_id} after {TELEGRAM_RETRY_ATTEMPTS} attempts")
