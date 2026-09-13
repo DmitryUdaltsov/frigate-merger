@@ -943,14 +943,32 @@ def on_message(client, userdata, msg):
         logger.error(f"MQTT error: {e}")
 
 # ========== MAIN ==========
+def cleanup_orphan_new_snapshots():
+    """Удаляет snapshots, для которых в new_event уже нет исходного видео."""
+    removed = 0
+    for snapshot_path in NEW_DIR.glob("*.jpg"):
+        if not snapshot_path.with_suffix(".mp4").exists():
+            snapshot_path.unlink(missing_ok=True)
+            removed += 1
+    if removed:
+        logger.info(f"Startup: removed {removed} orphan snapshots from {NEW_DIR}")
+
 def main():
     recover_untracked_send_files()
     threading.Thread(target=delivery_retry_loop, daemon=True).start()
 
-    initial = list(NEW_DIR.glob("*.mp4"))
+    cleanup_orphan_new_snapshots()
+    initial = sorted(NEW_DIR.glob("*.mp4"))
     if initial:
         logger.info(f"Startup: {len(initial)} files found → force merge")
-        fake_list = [(p, None, "", "", []) for p in initial]
+        fake_list = []
+        for video_path in initial:
+            snapshot_path = video_path.with_suffix(".jpg")
+            fake_list.append((
+                video_path,
+                snapshot_path if snapshot_path.exists() else None,
+                "", "", []
+            ))
         threading.Thread(target=lambda: process_batch(fake_list), daemon=True).start()
 
     threading.Thread(target=worker_loop, daemon=True).start()
