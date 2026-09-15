@@ -38,13 +38,16 @@ SEND_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 event_queue = queue.Queue()
+balcony_event_queue = queue.Queue()
 merge_lock = threading.Lock()
 event_descriptions = {}
 event_faces = {}  # {event_id: [{"name": str, "score": float}, ...]}
+seen_event_ids = {}
 
 # Семафор для ограничения параллельных NVENC сессий (1 одновременно — безопасно для GTX 1650)
 nvenc_semaphore = threading.Semaphore(1)
 delivery_lock = threading.Lock()
+seen_events_lock = threading.Lock()
 
 # ========== ЛОГГЕР ==========
 logging.basicConfig(
@@ -61,6 +64,10 @@ FRIGATE_CLIP_POST_CAPTURE = float(globals().get("FRIGATE_CLIP_POST_CAPTURE", 1))
 FRIGATE_CLIP_FINALIZE_DELAY = float(globals().get("FRIGATE_CLIP_FINALIZE_DELAY", 10))
 FRIGATE_CLIP_DURATION_TOLERANCE = float(globals().get("FRIGATE_CLIP_DURATION_TOLERANCE", 3))
 TELEGRAM_PENDING_RETRY_INTERVAL = int(globals().get("TELEGRAM_PENDING_RETRY_INTERVAL", 300))
+EVENT_DEDUP_TTL = int(globals().get("EVENT_DEDUP_TTL", 86400))
+BALCONY_GROUP_TIMEOUT = float(globals().get("BALCONY_GROUP_TIMEOUT", 10))
+BALCONY_MIN_EVENT_DURATION = float(globals().get("BALCONY_MIN_EVENT_DURATION", 3))
+BALCONY_MAX_GROUP_EVENTS = int(globals().get("BALCONY_MAX_GROUP_EVENTS", 10))
 
 # ========== УТИЛИТЫ ==========
 def has_audio_stream(path):
@@ -838,6 +845,108 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 # ========== WORKER ==========
+def register_event_once(event_id):
+    """Возвращает False для повторного MQTT end с тем же event_id."""
+    now = time.time()
+    cutoff = now - max(60, EVENT_DEDUP_TTL)
+    with seen_events_lock:
+        expired = [eid for eid, seen_at in seen_event_ids.items() if seen_at < cutoff]
+        for eid in expired:
+            seen_event_ids.pop(eid, None)
+        if event_id in seen_event_ids:
+            return False
+        seen_event_ids[event_id] = now
+        return True
+
+def clear_event_metadata(events):
+    for event in events:
+        event_id = event.get("id")
+        if event_id:
+            event_descriptions.pop(event_id, None)
+            event_faces.pop(event_id, None)
+
+def balcony_worker_loop():
+    """Объединяет близкие события балкона и отправляет один ролик вместо серии дублей."""
+    logger.info("Balcony worker started")
+    while True:
+        first_data = balcony_event_queue.get()
+        events = [first_data["after"]]
+
+        while len(events) < max(1, BALCONY_MAX_GROUP_EVENTS):
+            try:
+                next_data = balcony_event_queue.get(timeout=max(0.1, BALCONY_GROUP_TIMEOUT))
+                events.append(next_data["after"])
+            except queue.Empty:
+                break
+
+        valid_events = [
+            event for event in events
+            if event.get("id") and event.get("start_time") is not None
+            and event.get("end_time") is not None
+        ]
+        if not valid_events:
+            clear_event_metadata(events)
+            continue
+
+        start_time = min(float(event["start_time"]) for event in valid_events)
+        end_time = max(float(event["end_time"]) for event in valid_events)
+        event_duration = max(0, end_time - start_time)
+        event_ids = [event["id"] for event in valid_events]
+
+        if event_duration < BALCONY_MIN_EVENT_DURATION:
+            logger.info(
+                f"Ignoring short balcony event group: {event_duration:.2f}s, "
+                f"events={event_ids}"
+            )
+            clear_event_metadata(events)
+            continue
+
+        first_event = valid_events[0]
+        primary_event_id = first_event["id"]
+        camera = first_event["camera"]
+        logger.info(
+            f"Processing balcony group: {len(valid_events)} event(s), "
+            f"duration={event_duration:.2f}s, events={event_ids}"
+        )
+        video_path, snapshot_path = download_clip(
+            primary_event_id, camera, start_time, end_time
+        )
+        if not video_path:
+            clear_event_metadata(events)
+            continue
+
+        description = next(
+            (event_descriptions.get(event["id"], "") for event in valid_events
+             if event_descriptions.get(event["id"])),
+            ""
+        )
+        if description:
+            description = translate_to_russian(description)
+
+        faces = []
+        seen_faces = set()
+        for event in valid_events:
+            for face in event_faces.get(event["id"], []):
+                face_key = (face.get("name"), face.get("score"))
+                if face_key not in seen_faces:
+                    seen_faces.add(face_key)
+                    faces.append(face)
+
+        process_single_video(
+            video_path, snapshot_path, primary_event_id,
+            description, faces, camera
+        )
+        clear_event_metadata(events)
+
+def resilient_balcony_worker_loop():
+    """Перезапускает обработчик балкона после неожиданной ошибки одного события."""
+    while True:
+        try:
+            balcony_worker_loop()
+        except Exception:
+            logger.exception("Balcony worker failed; restarting")
+            time.sleep(1)
+
 def worker_loop():
     logger.info("Worker started")
     while True:
@@ -917,7 +1026,21 @@ def on_message(client, userdata, msg):
             data = json.loads(msg.payload.decode())
             logger.debug(f"MQTT event: {data.get('type')} {data.get('after',{}).get('camera')}")
             if data.get("type") == "end":
-                event_queue.put(data)
+                event = data.get("after", {})
+                event_id = event.get("id")
+                if not event_id:
+                    return
+                if not register_event_once(event_id):
+                    logger.info(f"Ignoring duplicate MQTT end event: {event_id}")
+                    return
+                if event.get("false_positive"):
+                    logger.info(f"Ignoring false-positive event: {event_id}")
+                    clear_event_metadata([event])
+                    return
+                if event.get("camera") == "balcony":
+                    balcony_event_queue.put(data)
+                else:
+                    event_queue.put(data)
 
         elif msg.topic == MQTT_TOPIC_DESCR:
             data = json.loads(msg.payload.decode())
@@ -972,6 +1095,7 @@ def main():
         threading.Thread(target=lambda: process_batch(fake_list), daemon=True).start()
 
     threading.Thread(target=worker_loop, daemon=True).start()
+    threading.Thread(target=resilient_balcony_worker_loop, daemon=True).start()
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     client.username_pw_set(MQTT_USER, MQTT_PASS)
