@@ -68,6 +68,11 @@ EVENT_DEDUP_TTL = int(globals().get("EVENT_DEDUP_TTL", 86400))
 BALCONY_GROUP_TIMEOUT = float(globals().get("BALCONY_GROUP_TIMEOUT", 10))
 BALCONY_MIN_EVENT_DURATION = float(globals().get("BALCONY_MIN_EVENT_DURATION", 3))
 BALCONY_MAX_GROUP_EVENTS = int(globals().get("BALCONY_MAX_GROUP_EVENTS", 10))
+BALCONY_EVENT_MERGE_GAP = float(globals().get("BALCONY_EVENT_MERGE_GAP", 5))
+BALCONY_MAX_CLIP_DURATION = float(globals().get("BALCONY_MAX_CLIP_DURATION", 60))
+BALCONY_LONG_CLIP_MIN_DURATION = float(
+    globals().get("BALCONY_LONG_CLIP_MIN_DURATION", 10)
+)
 
 # ========== УТИЛИТЫ ==========
 def has_audio_stream(path):
@@ -459,7 +464,9 @@ def normalize_video(input_path, output_path):
     )
 
 # ========== СКАЧИВАНИЕ ==========
-def download_clip(event_id, camera, start_time, end_time=None):
+def download_clip(
+    event_id, camera, start_time, end_time=None, minimum_duration_override=None
+):
     """Скачивает полный диапазон события с pre/post capture и snapshot."""
     expected_duration = None
     if end_time:
@@ -504,7 +511,9 @@ def download_clip(event_id, camera, start_time, end_time=None):
             downloaded_duration = get_video_duration(video_path)
             container_duration = get_duration(video_path)
             minimum_duration = (
-                max(1, expected_duration - FRIGATE_CLIP_DURATION_TOLERANCE)
+                max(1, float(minimum_duration_override))
+                if minimum_duration_override is not None
+                else max(1, expected_duration - FRIGATE_CLIP_DURATION_TOLERANCE)
                 if expected_duration else 1
             )
             if downloaded_duration < minimum_duration:
@@ -884,6 +893,109 @@ def clear_event_metadata(events):
             event_descriptions.pop(event_id, None)
             event_faces.pop(event_id, None)
 
+def split_balcony_event_groups(events):
+    """Группирует события по времени и не даёт одному объекту растянуть клип."""
+    max_duration = max(BALCONY_MIN_EVENT_DURATION, BALCONY_MAX_CLIP_DURATION)
+    merge_gap = max(0, BALCONY_EVENT_MERGE_GAP)
+    groups = []
+
+    for event in sorted(events, key=lambda item: float(item["start_time"])):
+        start_time = float(event["start_time"])
+        raw_end_time = max(start_time, float(event["end_time"]))
+        effective_end_time = min(raw_end_time, start_time + max_duration)
+
+        if not groups:
+            groups.append({
+                "events": [event],
+                "start_time": start_time,
+                "end_time": effective_end_time,
+                "raw_end_time": raw_end_time,
+            })
+            continue
+
+        group = groups[-1]
+        group_limit = group["start_time"] + max_duration
+        if (
+            event.get("camera") == group["events"][0].get("camera")
+            and start_time <= group["end_time"] + merge_gap
+            and start_time <= group_limit
+        ):
+            group["events"].append(event)
+            group["end_time"] = min(
+                group_limit, max(group["end_time"], effective_end_time)
+            )
+            group["raw_end_time"] = max(group["raw_end_time"], raw_end_time)
+        else:
+            groups.append({
+                "events": [event],
+                "start_time": start_time,
+                "end_time": effective_end_time,
+                "raw_end_time": raw_end_time,
+            })
+
+    return groups
+
+def process_balcony_event_group(group):
+    valid_events = group["events"]
+    start_time = group["start_time"]
+    end_time = group["end_time"]
+    event_duration = max(0, end_time - start_time)
+    raw_duration = max(0, group["raw_end_time"] - start_time)
+    event_ids = [event["id"] for event in valid_events]
+
+    if event_duration < BALCONY_MIN_EVENT_DURATION:
+        logger.info(
+            f"Ignoring short balcony event group: {event_duration:.2f}s, "
+            f"events={event_ids}"
+        )
+        return
+
+    was_capped = raw_duration > event_duration + 0.01
+    if was_capped:
+        logger.warning(
+            f"Capping balcony group from {raw_duration:.2f}s to "
+            f"{event_duration:.2f}s, events={event_ids}"
+        )
+
+    first_event = valid_events[0]
+    primary_event_id = first_event["id"]
+    camera = first_event["camera"]
+    logger.info(
+        f"Processing balcony group: {len(valid_events)} event(s), "
+        f"duration={event_duration:.2f}s, events={event_ids}"
+    )
+    minimum_duration = None
+    if was_capped:
+        minimum_duration = min(event_duration, BALCONY_LONG_CLIP_MIN_DURATION)
+    video_path, snapshot_path = download_clip(
+        primary_event_id, camera, start_time, end_time,
+        minimum_duration_override=minimum_duration
+    )
+    if not video_path:
+        return
+
+    description = next(
+        (event_descriptions.get(event["id"], "") for event in valid_events
+         if event_descriptions.get(event["id"])),
+        ""
+    )
+    if description:
+        description = translate_to_russian(description)
+
+    faces = []
+    seen_faces = set()
+    for event in valid_events:
+        for face in event_faces.get(event["id"], []):
+            face_key = (face.get("name"), face.get("score"))
+            if face_key not in seen_faces:
+                seen_faces.add(face_key)
+                faces.append(face)
+
+    process_single_video(
+        video_path, snapshot_path, primary_event_id,
+        description, faces, camera
+    )
+
 def balcony_worker_loop():
     """Объединяет близкие события балкона и отправляет один ролик вместо серии дублей."""
     logger.info("Balcony worker started")
@@ -907,55 +1019,11 @@ def balcony_worker_loop():
             clear_event_metadata(events)
             continue
 
-        start_time = min(float(event["start_time"]) for event in valid_events)
-        end_time = max(float(event["end_time"]) for event in valid_events)
-        event_duration = max(0, end_time - start_time)
-        event_ids = [event["id"] for event in valid_events]
-
-        if event_duration < BALCONY_MIN_EVENT_DURATION:
-            logger.info(
-                f"Ignoring short balcony event group: {event_duration:.2f}s, "
-                f"events={event_ids}"
-            )
+        try:
+            for group in split_balcony_event_groups(valid_events):
+                process_balcony_event_group(group)
+        finally:
             clear_event_metadata(events)
-            continue
-
-        first_event = valid_events[0]
-        primary_event_id = first_event["id"]
-        camera = first_event["camera"]
-        logger.info(
-            f"Processing balcony group: {len(valid_events)} event(s), "
-            f"duration={event_duration:.2f}s, events={event_ids}"
-        )
-        video_path, snapshot_path = download_clip(
-            primary_event_id, camera, start_time, end_time
-        )
-        if not video_path:
-            clear_event_metadata(events)
-            continue
-
-        description = next(
-            (event_descriptions.get(event["id"], "") for event in valid_events
-             if event_descriptions.get(event["id"])),
-            ""
-        )
-        if description:
-            description = translate_to_russian(description)
-
-        faces = []
-        seen_faces = set()
-        for event in valid_events:
-            for face in event_faces.get(event["id"], []):
-                face_key = (face.get("name"), face.get("score"))
-                if face_key not in seen_faces:
-                    seen_faces.add(face_key)
-                    faces.append(face)
-
-        process_single_video(
-            video_path, snapshot_path, primary_event_id,
-            description, faces, camera
-        )
-        clear_event_metadata(events)
 
 def resilient_balcony_worker_loop():
     """Перезапускает обработчик балкона после неожиданной ошибки одного события."""
