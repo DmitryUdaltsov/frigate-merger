@@ -1112,6 +1112,29 @@ def on_connect(client, userdata, flags, rc, properties=None):
     else:
         logger.error(f"MQTT connect failed: {rc}")
 
+def log_balcony_event_details(event):
+    """Пишет признаки события, необходимые для настройки фильтра бликов."""
+    start_time = event.get("start_time")
+    end_time = event.get("end_time")
+    duration = None
+    if start_time is not None and end_time is not None:
+        duration = max(0, float(end_time) - float(start_time))
+
+    logger.info(
+        "Balcony event details: id=%s, label=%s, duration=%s, "
+        "top_score=%s, stationary=%s, motionless_count=%s, "
+        "position_changes=%s, area=%s, box=%s",
+        event.get("id"),
+        event.get("label"),
+        f"{duration:.2f}s" if duration is not None else "unknown",
+        event.get("top_score", event.get("score")),
+        event.get("stationary"),
+        event.get("motionless_count"),
+        event.get("position_changes"),
+        event.get("area"),
+        event.get("box"),
+    )
+
 def on_message(client, userdata, msg):
     try:
         if msg.topic == MQTT_TOPIC:
@@ -1130,6 +1153,7 @@ def on_message(client, userdata, msg):
                     clear_event_metadata([event])
                     return
                 if event.get("camera") == "balcony":
+                    log_balcony_event_details(event)
                     balcony_event_queue.put(data)
                 else:
                     event_queue.put(data)
