@@ -91,6 +91,21 @@ def get_duration(path):
     except Exception:
         return 0.0
 
+def get_video_duration(path):
+    """Возвращает длительность видеодорожки, не подменяя её более длинным аудио."""
+    try:
+        result = subprocess.run([
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(path)
+        ], capture_output=True, text=True, timeout=10, check=True)
+        value = result.stdout.strip()
+        if value and value != "N/A":
+            return float(value)
+    except Exception:
+        pass
+    return get_duration(path)
+
 def run_ffmpeg(cmd, timeout=300):
     try:
         result = subprocess.run(
@@ -382,7 +397,8 @@ def delivery_retry_loop():
 
 # ========== НОРМАЛИЗАЦИЯ С FALLBACK И СТАБИЛЬНОЙ СИНХРОНИЗАЦИЕЙ ==========
 def normalize_video(input_path, output_path):
-    input_duration = get_duration(input_path)
+    input_duration = get_video_duration(input_path)
+    input_container_duration = get_duration(input_path)
     has_audio = has_audio_stream(input_path)
     video_filter = (
         "scale=1280:720:force_original_aspect_ratio=decrease,"
@@ -429,7 +445,7 @@ def normalize_video(input_path, output_path):
         run_ffmpeg(cmd_sw, timeout=600)
         logger.info(f"Normalized with CPU: {input_path.name}")
 
-    output_duration = get_duration(output_path)
+    output_duration = get_video_duration(output_path)
     if input_duration > 0 and output_duration < input_duration - 1:
         output_path.unlink(missing_ok=True)
         raise RuntimeError(
@@ -437,8 +453,9 @@ def normalize_video(input_path, output_path):
         )
     os.chmod(output_path, 0o664)
     logger.info(
-        f"Normalized: {output_path.name}, duration {input_duration:.2f}s -> "
-        f"{output_duration:.2f}s ({os.path.getsize(output_path)/1024/1024:.2f} MB)"
+        f"Normalized: {output_path.name}, video duration {input_duration:.2f}s -> "
+        f"{output_duration:.2f}s, input container {input_container_duration:.2f}s "
+        f"({os.path.getsize(output_path)/1024/1024:.2f} MB)"
     )
 
 # ========== СКАЧИВАНИЕ ==========
@@ -484,7 +501,8 @@ def download_clip(event_id, camera, start_time, end_time=None):
                 with open(video_path, "wb") as f:
                     for chunk in r.iter_content(8192):
                         f.write(chunk)
-            downloaded_duration = get_duration(video_path)
+            downloaded_duration = get_video_duration(video_path)
+            container_duration = get_duration(video_path)
             minimum_duration = (
                 max(1, expected_duration - FRIGATE_CLIP_DURATION_TOLERANCE)
                 if expected_duration else 1
@@ -501,7 +519,8 @@ def download_clip(event_id, camera, start_time, end_time=None):
             os.chmod(video_path, 0o664)
             video_ok = True
             logger.info(
-                f"Downloaded clip duration: {downloaded_duration:.2f}s"
+                f"Downloaded clip video duration: {downloaded_duration:.2f}s, "
+                f"container duration: {container_duration:.2f}s"
                 + (f" (requested {expected_duration:.2f}s)" if expected_duration else "")
             )
             break
@@ -546,7 +565,7 @@ def split_video(input_path, prefix):
     if size_mb <= MAX_SAFE_SIZE_MB:
         return [input_path]
 
-    duration = get_duration(input_path)
+    duration = get_video_duration(input_path)
     if duration <= 0:
         logger.error(f"split_video: cannot get duration of {input_path}")
         return [input_path]
@@ -614,7 +633,7 @@ def split_video(input_path, prefix):
             logger.error(f"Segment {out.name} was not created")
             break
 
-        part_dur = get_duration(out)
+        part_dur = get_video_duration(out)
         part_size = os.path.getsize(out)
         if part_dur <= 0 or part_size < 1024:
             logger.error(f"Segment {out.name} has zero duration or too small ({part_size} bytes), aborting split")
@@ -674,8 +693,8 @@ def process_single_video(video_path, snapshot_path, event_id, description, faces
             source_is_safe = True
         else:
             parts = split_video(norm_path, f"{norm_path.stem}_part")
-            split_duration = sum(get_duration(part) for part in parts)
-            original_duration = get_duration(norm_path)
+            split_duration = sum(get_video_duration(part) for part in parts)
+            original_duration = get_video_duration(norm_path)
             if parts and split_duration >= original_duration - 0.5:
                 for part in parts:
                     queue_delivery(part, None, caption, include_second_chat=False)
@@ -791,8 +810,8 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
             logger.warning(f"NVENC concat failed, falling back to software encoding. Error: {e}")
             run_ffmpeg(concat_cmd_sw)
 
-        expected_merged_duration = sum(get_duration(path) for path in normalized)
-        actual_merged_duration = get_duration(merged)
+        expected_merged_duration = sum(get_video_duration(path) for path in normalized)
+        actual_merged_duration = get_video_duration(merged)
         if actual_merged_duration < expected_merged_duration - 1:
             merged.unlink(missing_ok=True)
             raise RuntimeError(
@@ -817,8 +836,8 @@ def process_batch(file_paths):  # список кортежей (video_path, sna
             output_is_safe = True
         else:
             parts = split_video(merged, merged.stem)
-            split_duration = sum(get_duration(part) for part in parts)
-            merged_duration = get_duration(merged)
+            split_duration = sum(get_video_duration(part) for part in parts)
+            merged_duration = get_video_duration(merged)
             if parts and split_duration >= merged_duration - 0.5:
                 for part in parts:
                     queue_delivery(part, None, final_description, include_second_chat=True)
