@@ -70,6 +70,9 @@ BALCONY_MIN_EVENT_DURATION = float(globals().get("BALCONY_MIN_EVENT_DURATION", 3
 BALCONY_MAX_GROUP_EVENTS = int(globals().get("BALCONY_MAX_GROUP_EVENTS", 10))
 BALCONY_EVENT_MERGE_GAP = float(globals().get("BALCONY_EVENT_MERGE_GAP", 5))
 BALCONY_MAX_CLIP_DURATION = float(globals().get("BALCONY_MAX_CLIP_DURATION", 60))
+BALCONY_MIN_DOWNLOADED_CLIP_DURATION = float(
+    globals().get("BALCONY_MIN_DOWNLOADED_CLIP_DURATION", 3)
+)
 BALCONY_LONG_CLIP_MIN_DURATION = float(
     globals().get("BALCONY_LONG_CLIP_MIN_DURATION", 10)
 )
@@ -964,9 +967,11 @@ def process_balcony_event_group(group):
         f"Processing balcony group: {len(valid_events)} event(s), "
         f"duration={event_duration:.2f}s, events={event_ids}"
     )
-    minimum_duration = None
-    if was_capped:
-        minimum_duration = min(event_duration, BALCONY_LONG_CLIP_MIN_DURATION)
+    minimum_duration = min(
+        event_duration,
+        BALCONY_LONG_CLIP_MIN_DURATION
+        if was_capped else BALCONY_MIN_DOWNLOADED_CLIP_DURATION
+    )
     video_path, snapshot_path = download_clip(
         primary_event_id, camera, start_time, end_time,
         minimum_duration_override=minimum_duration
